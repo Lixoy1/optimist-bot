@@ -117,6 +117,7 @@ async def get_llm_response(user_text: str, chat_id: int, user_name: str):
                     return (await resp.json())["choices"][0]["message"]["content"]
     except Exception as e:
         logger.error(f"Groq error: {e}")
+logger.error(f"API Key: {GROQ_API_KEY[:10]}...")  # Покажет первые 10 символов ключа
     
     return f"@{user_name}, я на связи! 🌟"
 
