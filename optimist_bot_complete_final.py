@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Оптимист v14 — меню, рисование, инвестор, интенсивность, гороскоп по знаку,
-подсказки команд при "/" и ответ на "кто ты"
+Оптимист v15 — финальные правки: /help, /start, точная интенсивность 10-100%
 """
 
 import os
@@ -28,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 # === Логирование ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("OPTIMIST_v14")
+logger = logging.getLogger("OPTIMIST_v15")
 
 load_dotenv()
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -67,11 +66,11 @@ def start_http_server():
         logger.error(f"HTTP server error: {e}")
 
 # === Хранилище ===
-SETTINGS_FILE = "bot_settings_v14.json"
+SETTINGS_FILE = "bot_settings_v15.json"
 chat_settings = defaultdict(lambda: {
     "mood": "optimist",
     "response_length": "medium",
-    "activity_level": 0.25,
+    "activity_level": 0.25,          # будет меняться на 0.10-1.00
     "allow_profanity": False,
     "silence_until": 0.0,
     "morning_enabled": True,
@@ -133,7 +132,7 @@ def update_chat_stats(chat_id: int, user_id: int, text: str):
     if len(stats["messages"]) > 25:
         stats["messages"] = stats["messages"][-25:]
 
-# === Настроения ===
+# === Настроения (прежние) ===
 MOODS = {
     "optimist": {
         "name": "😊 Оптимист",
@@ -173,10 +172,18 @@ RESPONSE_LENGTHS = {
     "long": {"name": "Развёрнутый", "max_tokens": 900}
 }
 
+# === Интенсивность (шаг 10%) ===
 ACTIVITY_LEVELS = {
-    "min": {"name": "Минимальная", "value": 0.1},
-    "mid": {"name": "Средняя", "value": 0.35},
-    "max": {"name": "Высокая", "value": 0.7}
+    "10": {"name": "10%", "value": 0.10},
+    "20": {"name": "20%", "value": 0.20},
+    "30": {"name": "30%", "value": 0.30},
+    "40": {"name": "40%", "value": 0.40},
+    "50": {"name": "50%", "value": 0.50},
+    "60": {"name": "60%", "value": 0.60},
+    "70": {"name": "70%", "value": 0.70},
+    "80": {"name": "80%", "value": 0.80},
+    "90": {"name": "90%", "value": 0.90},
+    "100": {"name": "100%", "value": 1.00}
 }
 
 OPTIMISTIC_QUOTES = [
@@ -289,8 +296,35 @@ async def generate_image_url(prompt: str, style: str = "realistic, high detail")
     encoded = urllib.parse.quote(full)
     return f"https://image.pollinations.ai/prompt/{encoded}?width=832&height=832&model=flux&safe=false"
 
+# === Приветственное сообщение ===
+START_TEXT = (
+    "🌟 <b>Привет! Я Оптимист — универсальный AI‑бот с характером.</b>\n\n"
+    "🎭 <b>5 режимов общения:</b> Оптимист, Пессимист, Юморист, Инвестор, Мафиози.\n"
+    "🎨 <b>Рисую картинки и стикеры</b> по запросу (нарисуй …).\n"
+    "🔮 <b>Генерирую гороскоп</b> – можно указать знак зодиака: /гороскоп овен\n"
+    "🔪 <b>Анализирую чат</b> как дон мафии (/анализ)\n"
+    "📝 <b>Составляю резюме беседы</b> (/summary 2)\n"
+    "🌅 <b>Утреннее приветствие</b> с курсами валют (8:00 МСК)\n\n"
+    "⚙️ <b>Гибкая настройка:</b> длина ответов, мат, интенсивность в группах.\n"
+    "💡 Чтобы я точно ответил, упомяни меня или напиши «оптимист».\n\n"
+    "Выбери режим общения или открой настройки 👇"
+)
+
 # === Меню ===
-@router.message(Command("start", "menu"))
+@router.message(Command("start"))
+async def cmd_start(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="😊 Оптимист", callback_data="mood_optimist")],
+        [InlineKeyboardButton(text="😔 Пессимист", callback_data="mood_pessimist")],
+        [InlineKeyboardButton(text="🤣 Юморист", callback_data="mood_humor")],
+        [InlineKeyboardButton(text="💰 Инвестор", callback_data="mood_investor_genius")],
+        [InlineKeyboardButton(text="🔪 Мафиози", callback_data="mood_mafioso")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text="❌ Закрыть меню", callback_data="close_menu")]
+    ])
+    await message.reply(START_TEXT, reply_markup=kb)
+
+@router.message(Command("menu"))
 async def cmd_menu(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="😊 Оптимист", callback_data="mood_optimist")],
@@ -301,7 +335,7 @@ async def cmd_menu(message: types.Message):
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
         [InlineKeyboardButton(text="❌ Закрыть меню", callback_data="close_menu")]
     ])
-    await message.reply("🎭 <b>Выбери режим общения:</b>", reply_markup=kb)
+    await message.reply("🎭 <b>Меню режимов и настроек</b>", reply_markup=kb)
 
 @router.callback_query(F.data == "close_menu")
 async def close_menu(call: CallbackQuery):
@@ -321,13 +355,15 @@ async def show_settings(call: CallbackQuery):
     cid = str(call.message.chat.id)
     s = chat_settings[cid]
     length_name = RESPONSE_LENGTHS[s["response_length"]]["name"]
-    current_act = s["activity_level"]
-    act_key = "mid"
-    for k, v in ACTIVITY_LEVELS.items():
-        if abs(v["value"] - current_act) < 0.01:
-            act_key = k
-            break
+
+    # Определим текущий ключ активности по значению
+    act_pct = int(s["activity_level"] * 100)
+    act_key = f"{act_pct}"
+    if act_key not in ACTIVITY_LEVELS:
+        # fallback
+        act_key = "30"
     activity_name = ACTIVITY_LEVELS[act_key]["name"]
+
     prof = "✅ Вкл" if s["allow_profanity"] else "❌ Выкл"
     morning = "🌅 Вкл" if s["morning_enabled"] else "🌅 Выкл"
 
@@ -357,14 +393,18 @@ async def toggle_length(call: CallbackQuery):
 async def toggle_activity(call: CallbackQuery):
     cid = str(call.message.chat.id)
     s = chat_settings[cid]
-    keys = list(ACTIVITY_LEVELS.keys())
-    current_idx = 1
-    for i, k in enumerate(keys):
-        if abs(s["activity_level"] - ACTIVITY_LEVELS[k]["value"]) < 0.01:
-            current_idx = i
-            break
-    new_idx = (current_idx + 1) % len(keys)
-    s["activity_level"] = ACTIVITY_LEVELS[keys[new_idx]]["value"]
+    # текущий процент
+    current_pct = int(s["activity_level"] * 100)
+    # список доступных процентов
+    pcts = [int(k) for k in ACTIVITY_LEVELS.keys()]
+    pcts.sort()
+    try:
+        idx = pcts.index(current_pct)
+    except ValueError:
+        idx = 2  # 30%
+    new_idx = (idx + 1) % len(pcts)
+    new_pct = pcts[new_idx]
+    s["activity_level"] = ACTIVITY_LEVELS[str(new_pct)]["value"]
     save_settings()
     await show_settings(call)
 
@@ -386,9 +426,19 @@ async def toggle_morning(call: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(call: CallbackQuery):
-    await cmd_menu(call.message)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="😊 Оптимист", callback_data="mood_optimist")],
+        [InlineKeyboardButton(text="😔 Пессимист", callback_data="mood_pessimist")],
+        [InlineKeyboardButton(text="🤣 Юморист", callback_data="mood_humor")],
+        [InlineKeyboardButton(text="💰 Инвестор", callback_data="mood_investor_genius")],
+        [InlineKeyboardButton(text="🔪 Мафиози", callback_data="mood_mafioso")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text="❌ Закрыть меню", callback_data="close_menu")]
+    ])
+    await call.message.edit_text("🎭 <b>Меню режимов и настроек</b>", reply_markup=kb)
+    await call.answer()
 
-# === Гороскоп со знаком ===
+# === Гороскоп ===
 ZODIAC_SIGNS = {
     "овен": "Овен", "телец": "Телец", "близнецы": "Близнецы", "рак": "Рак",
     "лев": "Лев", "дева": "Дева", "весы": "Весы", "скорпион": "Скорпион",
@@ -514,29 +564,50 @@ async def cmd_summary(message: types.Message):
         summary = f"@{user_name}, резюме составить не удалось."
     await message.reply(f"📝 Краткое резюме за последние {interval_hours} ч:\n{summary}")
 
-# === ОСНОВНОЙ ХЕНДЛЕР ===
+# === О себе ===
 ABOUT_BOT_TEXT = (
     "🤖 <b>Я — Оптимист!</b>\n"
     "Многорежимный AI-бот с характером.\n\n"
-    "🎭 <b>Могу общаться в пяти стилях:</b> Оптимист, Пессимист, Юморист, Инвестор, Мафиози.\n"
-    "🎨 <b>Рисую картинки</b> и <b>стикеры</b> по запросу.\n"
-    "🔮 <b>Генерирую гороскопы</b> (в том числе по знаку зодиака).\n"
-    "🔪 <b>Провожу мафиозный анализ</b> чата.\n"
-    "📝 <b>Составляю резюме</b> обсуждений (/summary).\n"
-    "🌅 <b>Присылаю утренние приветствия</b> с курсами валют.\n\n"
-    "⚙️ <b>Настройки:</b> длина ответов, интенсивность в группе, мат, утреннее приветствие.\n"
-    "💡 Чтобы я точно ответил, упомяни меня (@Optimist2_Bot) или напиши «оптимист»."
+    "🎭 <b>5 стилей:</b> Оптимист, Пессимист, Юморист, Инвестор, Мафиози.\n"
+    "🎨 <b>Рисую</b> по запросу (нарисуй …).\n"
+    "🔮 <b>Гороскопы</b> по знаку зодиака.\n"
+    "🔪 <b>Мафиозный анализ</b> чата.\n"
+    "📝 <b>Резюме беседы</b> (/summary).\n"
+    "🌅 <b>Утро</b> с курсами валют.\n\n"
+    "💡 Чтобы я ответил, упомяни меня или напиши «оптимист»."
 )
 
-# Ключевые фразы, на которые бот должен ответить "о себе"
 ABOUT_TRIGGERS = [
     "кто ты", "ты кто", "что ты умеешь", "твои возможности",
     "расскажи о себе", "что ты такое", "чего умеешь"
 ]
 
+# === Help (гарантированно срабатывает) ===
+@router.message(Command("help"))
+async def cmd_help(message: types.Message):
+    help_text = (
+        "📋 <b>Доступные команды</b>\n\n"
+        "/start – главное меню с приветствием\n"
+        "/menu – меню режимов и настроек\n"
+        "/help – этот список\n"
+        "/horoscope или /гороскоп [знак] – гороскоп на сегодня\n"
+        "/analyze или /анализ – мафиозный разбор чата\n"
+        "/summary [часы] – резюме сообщений за период\n"
+        "/stats – статистика чата\n\n"
+        "🎨 <b>Рисование:</b> нарисуй <запрос> (можно добавить «в стиле …»)\n"
+        "🤫 <b>Тишина:</b> напиши «помолчи» или «тихо», бот замолчит на 15 мин.\n\n"
+        "💡 <b>Совет:</b> в группе упомяни меня (@botusername) или напиши «оптимист», чтобы я ответил."
+    )
+    await message.reply(help_text)
+
+# === Основной обработчик (располагаем последним, чтобы команды ловились раньше) ===
 @router.message()
 async def main_handler(message: types.Message):
     if not message.text:
+        return
+
+    # Не обрабатываем команды (начинающиеся с '/'), чтобы не мешать Command-фильтрам
+    if message.text.startswith('/'):
         return
 
     chat_id = message.chat.id
@@ -636,24 +707,7 @@ async def morning_loop():
 async def welcome_new_chat(message: types.Message):
     for user in message.new_chat_members:
         if user.id == bot.id:
-            await message.reply(ABOUT_BOT_TEXT)
-
-# === Help ===
-@router.message(Command("help"))
-async def cmd_help(message: types.Message):
-    text = (
-        "📋 <b>Команды бота Оптимист</b>\n\n"
-        "🎭 /menu — меню режимов и настроек\n"
-        "🔮 /гороскоп [знак] — гороскоп (например /гороскоп овен)\n"
-        "🔪 /анализ — мафиозный разбор чата\n"
-        "📝 /summary [часы] — резюме обсуждений\n"
-        "📊 /stats — статистика чата\n"
-        "🎨 нарисуй <запрос> — рисунок\n"
-        "🤫 помолчи / тихо — молчать 15 мин\n"
-        "💡 Упомяни меня или напиши «оптимист» — гарантированный ответ!\n\n"
-        "Ещё можно спросить «кто ты» — я расскажу о себе."
-    )
-    await message.reply(text)
+            await message.reply(START_TEXT)
 
 # === Запуск ===
 async def on_startup():
@@ -662,10 +716,9 @@ async def on_startup():
     me = await bot.get_me()
     BOT_USERNAME = me.username
 
-    # Установка списка команд для подсказок при вводе "/"
     commands = [
-        BotCommand(command="start", description="Главное меню и настройки"),
-        BotCommand(command="menu", description="Меню выбора режима"),
+        BotCommand(command="start", description="Главное меню и приветствие"),
+        BotCommand(command="menu", description="Меню режимов и настроек"),
         BotCommand(command="help", description="Список команд"),
         BotCommand(command="horoscope", description="Гороскоп (можно указать знак)"),
         BotCommand(command="analyze", description="Анализ чата (режим Мафиози)"),
