@@ -183,7 +183,7 @@ async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
 Не повторяй контекст дословно.
 Контекст: {context}"""
     payload = {
-        "model": "llama-3.1-70b-versatile",
+        "model": "llama-3.3-70b-versatile",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text}
@@ -330,7 +330,7 @@ async def generate_horoscope(chat_id: int, user_name: str) -> str:
 Тон: {mood}. 5-7 предложений, с эмодзи."""
     try:
         payload = {
-            "model": "llama-3.1-70b-versatile",
+            "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.9,
             "max_tokens": 250
@@ -372,7 +372,7 @@ async def cmd_analyze(message: types.Message):
 Дай короткий расклад: кто подозрительный, кого проверить."""
     try:
         payload = {
-            "model": "llama-3.1-70b-versatile",
+            "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
             "max_tokens": 300
