@@ -54,7 +54,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"Optimist Bot is running!")
 
     def log_message(self, format, *args):
-        pass  # Отключаем логи HTTP
+        pass
 
 def start_http_server():
     PORT = int(os.environ.get("PORT", 8000))
