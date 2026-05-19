@@ -19,6 +19,7 @@ from aiogram import Bot, Dispatcher, Router, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 import aiohttp
 
@@ -35,7 +36,7 @@ if not TG_TOKEN:
     logger.error("TG_TOKEN не найден!")
     exit(1)
 
-bot = Bot(token=TG_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 
@@ -54,7 +55,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"Optimist Bot is running!")
 
     def log_message(self, format, *args):
-        pass
+        pass  # Отключаем логи HTTP
 
 def start_http_server():
     PORT = int(os.environ.get("PORT", 8000))
