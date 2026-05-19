@@ -153,6 +153,10 @@ async def message_handler(message: types.Message):
     user_name = message.from_user.first_name or "друг"
     text = message.text.lower()
     
+    # Пропускаем команды (они обрабатываются отдельно)
+    if text.startswith("/"):
+        return
+    
     # Генерация изображений
     if text.startswith(("нарисуй", "сгенерируй стикер", "покажи картинку")):
         prompt = text.replace("нарисуй", "").replace("сгенерируй стикер", "").replace("покажи картинку", "").strip()
