@@ -57,7 +57,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         pass  # Отключаем логи HTTP
 
 def start_http_server():
-    PORT = 8000
+    PORT = int(os.environ.get("PORT", 8000))
     with socketserver.TCPServer(("", PORT), HealthHandler) as httpd:
         logger.info(f"🌐 HTTP сервер запущен на порту {PORT}")
         httpd.serve_forever()
