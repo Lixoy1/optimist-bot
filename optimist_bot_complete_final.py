@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Оптимист v9 — ФИНАЛЬНАЯ ВЕРСИЯ
-Полный бот со всеми функциями из описания
+Оптимист v12 — полный финальный бот с /summary, Groq+Gemini, контекстными реакциями, меню, гороскопами, аналитикой, рисованием и приветствием.
 """
 
 import os
@@ -26,9 +25,9 @@ from dotenv import load_dotenv
 import aiohttp
 from zoneinfo import ZoneInfo
 
-# ==================== ЛОГИРОВАНИЕ ====================
+# === Логирование ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("OPTIMIST_v9")
+logger = logging.getLogger("OPTIMIST_v12")
 
 load_dotenv()
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -44,7 +43,7 @@ dp = Dispatcher()
 router = Router()
 BOT_USERNAME: Optional[str] = None
 
-# ==================== HTTP HEALTHCHECK ====================
+# ==================== HTTP HEALTHCHECK (Railway) ====================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/health", "/healthz"):
@@ -66,8 +65,8 @@ def start_http_server():
     except Exception as e:
         logger.error(f"HTTP server error: {e}")
 
-# ==================== НАСТРОЙКИ ====================
-SETTINGS_FILE = "bot_settings_v9.json"
+# === Настройки и статистика ===
+SETTINGS_FILE = "bot_settings_v12.json"
 chat_settings = defaultdict(lambda: {
     "mood": "optimist",
     "response_length": "medium",
@@ -79,7 +78,6 @@ chat_settings = defaultdict(lambda: {
     "horoscope_cache": {"date": "", "text": ""},
     "context_reactions": True
 })
-
 chat_stats = defaultdict(lambda: {
     "total_messages": 0,
     "participants": set(),
@@ -88,8 +86,8 @@ chat_stats = defaultdict(lambda: {
     "weekly_messages": defaultdict(int)
 })
 
+# === Загрузка и сохранение ===
 def load_settings():
-    global chat_settings, chat_stats
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -123,6 +121,7 @@ def save_settings():
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+# === Обновление статистики ===
 def update_chat_stats(chat_id: int, user_id: int, text: str):
     cid = str(chat_id)
     stats = chat_stats[cid]
@@ -132,10 +131,7 @@ def update_chat_stats(chat_id: int, user_id: int, text: str):
     stats["participants"].add(user_id)
     stats["daily_messages"][today] += 1
     stats["weekly_messages"][week] += 1
-    stats["messages"].append({
-        "text": text[:250],
-        "ts": datetime.datetime.now().timestamp()
-    })
+    stats["messages"].append({"text": text[:250], "ts": datetime.datetime.now().timestamp()})
     if len(stats["messages"]) > 25:
         stats["messages"] = stats["messages"][-25:]
 
@@ -164,7 +160,13 @@ MOODS = {
     "mafioso": {
         "name": "🔪 Мафиози",
         "emoji": "🕴️",
-        "prompt": "Ты — авторитетный мафиози в стиле Дон Корлеоне. Говоришь по понятиям, используешь жаргон: братва, развод, чисто, по фэншую."
+        "prompt": """Ты — мафиози из классической игры в Мафию в стиле Дон Корлеоне.
+Твои ответы должны:
+- Говорить спокойно, веско, с достоинством и скрытой угрозой
+- Использовать отсылки к игре: "Ты случайно не любовница?", "Ты говоришь ты мирный житель но за маской дон!", "Где ты был ночью? У меня есть алиби, а у тебя?", "Ты слишком активно говоришь, мирняк так не делает", "Молчишь? Значит виноват!", "Я тебя проверю, если что — не обижайся", "Чисто? Да ладно, я тебе не верю", "Ты слишком умный для мирного жителя", "Где твой напарник? А может ты и есть дон?", "Я тебя видел с шерифом вчера вечером...", "Ты слишком спокойно себя ведёшь для мафии", "Я бы на твоём месте не говорил так много", "Ты случайно не комиссар?", "У тебя слишком много алиби, это подозрительно"
+- Отвечать с характером старого дона, но с юмором и иронией
+- Коротко, веско, с скрытой угрозой
+- Никогда не говорить как уличная братва — только как авторитетный дон"""
     }
 }
 
@@ -184,10 +186,9 @@ OPTIMISTIC_QUOTES = [
     "«Ты сильнее, чем думаешь. Сегодня — твой день!» 💪"
 ]
 
-# ==================== LLM ====================
+# ==================== LLM (Groq + Gemini) ====================
 async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperature: float = 0.8) -> Optional[str]:
-    """Пытается получить ответ сначала от Groq, потом от Gemini"""
-    # 1. Groq
+    # 1. Пробуем Groq
     if GROQ_API_KEY:
         try:
             async with aiohttp.ClientSession() as session:
@@ -207,41 +208,30 @@ async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperatu
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        logger.info("✅ Ответ от Groq получен")
                         return data["choices"][0]["message"]["content"].strip()
-                    else:
-                        logger.warning(f"Groq вернул {resp.status}")
         except Exception as e:
             logger.warning(f"Groq ошибка: {e}")
-    
-    # 2. Gemini (если есть ключ и Groq не сработал)
+
+    # 2. Пробуем Gemini
     if GEMINI_API_KEY:
         try:
             gemini_model = "gemini-2.0-flash"
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={GEMINI_API_KEY}"
             payload = {
-                "contents": [
-                    {"role": "user", "parts": [{"text": f"{system_prompt}\n\nПользователь: {user_text}"}]}
-                ],
-                "generationConfig": {
-                    "temperature": temperature,
-                    "maxOutputTokens": max_tokens
-                }
+                "contents": [{"role": "user", "parts": [{"text": f"{system_prompt}\n\nПользователь: {user_text}"}]}],
+                "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}
             }
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=25)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        logger.info("✅ Ответ от Gemini получен")
                         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    else:
-                        logger.warning(f"Gemini вернул {resp.status}")
         except Exception as e:
             logger.warning(f"Gemini ошибка: {e}")
-    
+
     return None
 
-# ==================== ГЕНЕРАЦИЯ ОТВЕТА ====================
+# ==================== Генерация ответа ====================
 async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
     cid = str(chat_id)
     s = chat_settings[cid]
@@ -249,43 +239,40 @@ async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
     length_key = s["response_length"]
     length = RESPONSE_LENGTHS[length_key]
     allow_prof = s["allow_profanity"]
-    
+
     prof_rule = "Мат разрешён." if allow_prof else "Мат ЗАПРЕЩЁН."
     length_rule = {
         "short": "Ответь ОЧЕНЬ коротко (1-2 предложения).",
         "medium": "Ответь в одном абзаце (4-7 предложений).",
         "long": "Дай развёрнутый ответ из 2-3 абзацев."
     }[length_key]
-    
+
     system_prompt = (
         f"{mood['prompt']}\n"
         f"{length_rule}\n"
         f"{prof_rule}\n"
         f"Ты общаешься в Telegram. Начинай ответ строго с @{user_name}, затем продолжай. "
-        f"НЕ повторяй фразу пользователя. Не пиши «ты спросил...» или «по поводу...». "
-        f"Отвечай сразу по существу, живо и эмоционально."
+        f"НЕ повторяй фразу пользователя. Отвечай сразу по существу."
     )
-    
-    # Попытка через LLM
+
     answer = await ask_llm(system_prompt, user_text, length["max_tokens"])
     if answer:
         return answer
-    
-    # Если LLM не ответила — креативный fallback
-    logger.warning("LLM не ответила, использую fallback")
+
     return local_fallback(user_text, user_name, s["mood"])
 
 def local_fallback(text: str, name: str, mood: str) -> str:
+    if mood == "mafioso":
+        return f"@{name}, братва, я бы на твоём месте не говорил так много... 🔪"
     reactions = {
         "optimist": f"@{name}, отличный настрой! Всё получится! 🌟",
         "pessimist": f"@{name}, мда... Но я бы не стал так переживать. 😕",
         "humor": f"@{name}, это напомнило мне анекдот про... 😂",
-        "investor_genius": f"@{name}, с такими мыслями только в крипту! 💰",
-        "mafioso": f"@{name}, братва, разберёмся. Чисто по фэншую. 🔪"
+        "investor_genius": f"@{name}, с такими мыслями только в крипту! 💰"
     }
     return reactions.get(mood, f"@{name}, я тебя услышал!")
 
-# ==================== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ====================
+# ==================== Генерация изображений ====================
 async def generate_image_url(prompt: str, style: str = "реализм, высокая детализация") -> Optional[str]:
     try:
         full = f"{prompt}, {style}"
@@ -295,7 +282,7 @@ async def generate_image_url(prompt: str, style: str = "реализм, высо
         logger.error(f"Pollinations error: {e}")
         return None
 
-# ==================== МЕНЮ (с исчезанием) ====================
+# ==================== МЕНЮ ====================
 @router.message(Command("start", "menu"))
 async def cmd_menu(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -324,15 +311,9 @@ async def show_settings(call: CallbackQuery):
     activity_name = ACTIVITY_NAMES[ACTIVITY_LEVELS.index(s["activity_level"])] if s["activity_level"] in ACTIVITY_LEVELS else "Средняя"
     prof = "✅ Вкл" if s["allow_profanity"] else "❌ Выкл"
     morning = "🌅 Вкл" if s["morning_enabled"] else "🌅 Выкл"
-    
-    text = (
-        f"⚙️ <b>Настройки</b>\n\n"
-        f"📝 Длина ответов: {length_name}\n"
-        f"📊 Интенсивность: {activity_name}\n"
-        f"🤬 Мат: {prof}\n"
-        f"🌅 Утро: {morning}"
-    )
-    
+
+    text = f"⚙️ <b>Настройки</b>\n\n📝 Длина: {length_name}\n📊 Интенсивность: {activity_name}\n🤬 Мат: {prof}\n🌅 Утро: {morning}"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Длина: " + length_name, callback_data="toggle_length")],
         [InlineKeyboardButton(text="📊 Интенсивность: " + activity_name, callback_data="toggle_activity")],
@@ -389,15 +370,15 @@ async def generate_horoscope(chat_id: int, user_name: str) -> str:
     cache = chat_settings[cid].get("horoscope_cache", {})
     if cache.get("date") == today and cache.get("text"):
         return cache["text"]
-    
+
     mood = MOODS[chat_settings[cid]["mood"]]["name"]
     prompt = f"Напиши короткий позитивный гороскоп на сегодня для {user_name}. Тон: {mood}. 5-7 предложений с эмодзи."
     system = "Ты — астролог-оптимист. Отвечай сразу, без вступления."
-    
+
     text = await ask_llm(system, prompt, max_tokens=250, temperature=0.9)
     if not text:
         text = f"@{user_name}, сегодня звёзды говорят: удача на твоей стороне! 🌟"
-    
+
     chat_settings[cid]["horoscope_cache"] = {"date": today, "text": text}
     save_settings()
     return text
@@ -416,20 +397,20 @@ async def cmd_analyze(message: types.Message):
     if chat_settings[cid]["mood"] != "mafioso":
         await message.reply("🔪 Аналитика только в режиме Мафиози. Переключи в /menu")
         return
-    
+
     recent = chat_stats[cid]["messages"][-15:]
     if not recent:
         await message.reply("Чат пуст, братва.")
         return
-    
+
     msgs = "\n".join([m["text"][:100] for m in recent])
-    system = "Ты мафиози-аналитик в стиле Дон Корлеоне. Оцени чат на наличие подозрительных игроков. Говори коротко, по понятиям."
-    prompt = f"Последние сообщения в чате:\n{msgs}\nДай расклад."
-    
+    system = "Ты мафиози-аналитик в стиле Дон Корлеоне. Оцени чат на наличие подозрительных игроков. Говори коротко, по понятиям. Используй отсылки к игре в Мафию."
+    prompt = f"Последние сообщения в чате:\n{msgs}\n\nДай мафиозный расклад с отсылками к игре."
+
     analysis = await ask_llm(system, prompt, max_tokens=300, temperature=0.7)
     if not analysis:
         analysis = "Чисто, братва. Но присматриваюсь к одному типу. 🔪"
-    
+
     await message.reply(analysis)
 
 # ==================== РИСОВАНИЕ ====================
@@ -442,14 +423,14 @@ async def cmd_draw(message: types.Message):
         if text.lower().startswith(prefix):
             prompt = text[len(prefix):].strip()
             break
-    
+
     if not prompt or len(prompt) < 2:
         await message.reply("🖼️ Что нарисовать? Пример: нарисуй кота в стиле аниме")
         return
-    
+
     await message.reply(f"🎨 Рисую <b>{prompt}</b>...")
     url = await generate_image_url(prompt, "реализм, высокая детализация")
-    
+
     if url:
         try:
             await bot.send_photo(message.chat.id, url, caption=f"✨ {prompt}")
@@ -459,37 +440,66 @@ async def cmd_draw(message: types.Message):
     else:
         await message.reply("😔 Не удалось сгенерировать")
 
+# ==================== /summary ====================
+@router.message(Command("summary"))
+async def cmd_summary(message: types.Message):
+    cid = str(message.chat.id)
+    user_name = message.from_user.first_name or "друг"
+    text_args = message.text.split()
+    interval_hours = 1
+    if len(text_args) > 1:
+        try:
+            interval_hours = int(text_args[1])
+        except:
+            interval_hours = 1
+
+    now_ts = datetime.datetime.now().timestamp()
+    start_ts = now_ts - interval_hours * 3600
+    recent_msgs = [m['text'] for m in chat_stats[cid]['messages'] if m['ts'] >= start_ts]
+
+    if not recent_msgs:
+        await message.reply(f"@{user_name}, за последние {interval_hours} ч сообщений нет.")
+        return
+
+    context_text = '\n'.join(recent_msgs[-25:])
+    system_prompt = f"Ты — AI-ассистент. Составь краткое резюме обсуждений в чате за последние {interval_hours} часов, оставь только суть, избегай повторов, структурируй по пунктам."
+    summary = await ask_llm(system_prompt, context_text, max_tokens=300, temperature=0.7)
+
+    if not summary:
+        summary = f"@{user_name}, резюме составить не удалось."
+
+    await message.reply(f"📝 Краткое резюме за последние {interval_hours} ч:\n{summary}")
+
 # ==================== ОСНОВНОЙ ХЕНДЛЕР ====================
 @router.message()
 async def main_handler(message: types.Message):
     if not message.text:
         return
-    
+
     chat_id = message.chat.id
     user_name = message.from_user.first_name or "друг"
     text = message.text.strip()
-    
+
     update_chat_stats(chat_id, message.from_user.id, text)
     cid = str(chat_id)
     s = chat_settings[cid]
-    
+
     # Тишина
     if s["silence_until"] > datetime.datetime.now().timestamp():
         return
-    
+
     if any(word in text.lower() for word in ["помолчи", "тихо"]):
         s["silence_until"] = datetime.datetime.now().timestamp() + 900
         save_settings()
         await message.reply("🤫 Молчу 15 минут.")
         return
-    
-    # Групповые реакции (по контексту)
+
+    # Групповые реакции
     if chat_id < 0:
         lower = text.lower()
         mentioned = (BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in lower) or ("оптимист" in lower)
-        
+
         if not mentioned and random() > s["activity_level"]:
-            # Реакции по контексту
             if any(word in lower for word in ["спасибо", "круто", "отлично", "супер"]):
                 try:
                     await message.reply("🔥")
@@ -506,10 +516,10 @@ async def main_handler(message: types.Message):
                 except:
                     pass
             return
-    
+
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
     response = await get_llm_response(text, chat_id, user_name)
-    
+
     try:
         await message.reply(response)
     except Exception as e:
@@ -519,15 +529,9 @@ async def main_handler(message: types.Message):
 async def get_rates():
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,tether&vs_currencies=rub",
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as resp:
+            async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,tether&vs_currencies=rub", timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 cg = await resp.json()
-            async with session.get(
-                "https://www.cbr-xml-daily.ru/daily_json.js",
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as resp:
+            async with session.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 cbr = await resp.json()
             return {
                 "btc": round(cg["bitcoin"]["rub"]),
@@ -542,14 +546,7 @@ async def get_rates():
 async def send_morning_greeting(chat_id: int):
     quote = choice(OPTIMISTIC_QUOTES)
     rates = await get_rates()
-    text = (
-        f"🌅 <b>Доброе утро!</b>\n\n{quote}\n\n"
-        f"💰 <b>Курсы:</b>\n"
-        f"• BTC: {rates['btc']} ₽\n"
-        f"• USDT: {rates['usdt']} ₽\n"
-        f"• USD: {rates['usd']} ₽\n"
-        f"• EUR: {rates['eur']} ₽"
-    )
+    text = f"🌅 <b>Доброе утро!</b>\n\n{quote}\n\n💰 <b>Курсы:</b>\n• BTC: {rates['btc']} ₽\n• USDT: {rates['usdt']} ₽\n• USD: {rates['usd']} ₽\n• EUR: {rates['eur']} ₽"
     try:
         await bot.send_message(chat_id, text)
     except Exception as e:
@@ -575,7 +572,7 @@ async def morning_loop():
             logger.error(f"Morning loop error: {e}")
             await asyncio.sleep(60)
 
-# ==================== ПРИВЕТСТВИЕ ПРИ ДОБАВЛЕНИИ В ЧАТ ====================
+# ==================== ПРИВЕТСТВИЕ ПРИ ДОБАВЛЕНИИ ====================
 @router.message(F.new_chat_members)
 async def welcome_new_chat(message: types.Message):
     for user in message.new_chat_members:
@@ -587,7 +584,8 @@ async def welcome_new_chat(message: types.Message):
                 f"• Рисовать картинки и стикеры\n"
                 f"• Давать гороскопы\n"
                 f"• Проводить мафиозную аналитику чата\n"
-                f"• Присылать утренние приветствия с курсами\n\n"
+                f"• Присылать утренние приветствия с курсами\n"
+                f"• Писать краткое резюме чата (/summary)\n\n"
                 f"Напиши /menu чтобы выбрать режим и настроить меня под себя!\n\n"
                 f"По умолчанию я в режиме Оптимист 🌟"
             )
@@ -602,22 +600,18 @@ async def cmd_help(message: types.Message):
         "🎭 <b>Режимы:</b>\n"
         "/menu — открыть меню выбора режима и настроек\n\n"
         "🔮 <b>Гороскоп:</b>\n"
-        "/гороскоп или /horoscope — персональный гороскоп на сегодня\n\n"
+        "/гороскоп или /horoscope — гороскоп на сегодня\n\n"
         "🔪 <b>Мафиозная аналитика:</b>\n"
         "/анализ или /analyze — разбор чата (только в режиме Мафиози)\n\n"
+        "📝 <b>Резюме чата:</b>\n"
+        "/summary [часы] — краткое содержание обсуждений за последние часы (по умолчанию 1 час)\n\n"
         "📊 <b>Статистика:</b>\n"
         "/stats — статистика чата\n\n"
         "🎨 <b>Рисование:</b>\n"
         "нарисуй <запрос> — создать картинку\n"
-        "сгенерируй стикер <запрос> — создать стикер\n"
-        "покажи картинку <запрос> — показать картинку\n\n"
+        "сгенерируй стикер <запрос> — создать стикер\n\n"
         "🤫 <b>Тишина:</b>\n"
         "помолчи / тихо / молчи 15 — бот замолчит на 15 минут\n\n"
-        "⚙️ <b>Настройки (в /menu):</b>\n"
-        "• Длина ответов (коротко/средне/развёрнуто)\n"
-        "• Интенсивность в группе (как часто реагирует)\n"
-        "• Разрешить/запретить мат\n"
-        "• Утреннее приветствие (вкл/выкл)\n\n"
         "💡 <b>Совет:</b> Упомяни меня (@Optimist2_Bot) или напиши «оптимист», чтобы я гарантированно ответил!"
     )
     await message.reply(text)
