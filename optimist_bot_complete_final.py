@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Оптимист v12 — полный финальный бот с /summary, Groq+Gemini, контекстными реакциями, меню, гороскопами, аналитикой, рисованием и приветствием.
+Оптимист v14 — меню, рисование, инвестор, интенсивность, гороскоп по знаку,
+подсказки команд при "/" и ответ на "кто ты"
 """
 
 import os
@@ -17,7 +18,7 @@ import http.server
 import socketserver
 
 from aiogram import Bot, Dispatcher, Router, types, F
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BotCommand
 from aiogram.filters import Command
 from aiogram.enums import ParseMode, ChatAction
 from aiogram.client.default import DefaultBotProperties
@@ -27,7 +28,7 @@ from zoneinfo import ZoneInfo
 
 # === Логирование ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("OPTIMIST_v12")
+logger = logging.getLogger("OPTIMIST_v14")
 
 load_dotenv()
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -43,7 +44,7 @@ dp = Dispatcher()
 router = Router()
 BOT_USERNAME: Optional[str] = None
 
-# ==================== HTTP HEALTHCHECK (Railway) ====================
+# === HTTP Healthcheck ===
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/health", "/healthz"):
@@ -65,8 +66,8 @@ def start_http_server():
     except Exception as e:
         logger.error(f"HTTP server error: {e}")
 
-# === Настройки и статистика ===
-SETTINGS_FILE = "bot_settings_v12.json"
+# === Хранилище ===
+SETTINGS_FILE = "bot_settings_v14.json"
 chat_settings = defaultdict(lambda: {
     "mood": "optimist",
     "response_length": "medium",
@@ -75,8 +76,7 @@ chat_settings = defaultdict(lambda: {
     "silence_until": 0.0,
     "morning_enabled": True,
     "last_morning_sent": "",
-    "horoscope_cache": {"date": "", "text": ""},
-    "context_reactions": True
+    "horoscope_cache": {}
 })
 chat_stats = defaultdict(lambda: {
     "total_messages": 0,
@@ -86,7 +86,6 @@ chat_stats = defaultdict(lambda: {
     "weekly_messages": defaultdict(int)
 })
 
-# === Загрузка и сохранение ===
 def load_settings():
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -121,7 +120,6 @@ def save_settings():
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-# === Обновление статистики ===
 def update_chat_stats(chat_id: int, user_id: int, text: str):
     cid = str(chat_id)
     stats = chat_stats[cid]
@@ -135,7 +133,7 @@ def update_chat_stats(chat_id: int, user_id: int, text: str):
     if len(stats["messages"]) > 25:
         stats["messages"] = stats["messages"][-25:]
 
-# ==================== НАСТРОЕНИЯ ====================
+# === Настроения ===
 MOODS = {
     "optimist": {
         "name": "😊 Оптимист",
@@ -155,7 +153,7 @@ MOODS = {
     "investor_genius": {
         "name": "💰 Гений инвестиций",
         "emoji": "📈",
-        "prompt": "Ты — гений трейдинга. Говоришь про хайпы, риски, FOMO с юмором и сарказмом."
+        "prompt": """Ты — лидер мнений в мире хайп-проектов, криптовалют и инвестиций. Твоя задача — давать ценные советы, анализировать маркетинг платформ, распознавать пирамиды и скамы. Ты говоришь про риски, FOMO, DeFi, токеномику, стейкинг, листинги. Делай краткие экспертные обзоры по запросу, всегда с иронией и здоровым цинизмом. Называй пользователя «инвестор» или «бро». Используй термины: хайп, разгон, памп, дамп, софт-кап, хард-кап, вайтлист, KYC, AMA. Не повторяйся."""
     },
     "mafioso": {
         "name": "🔪 Мафиози",
@@ -163,10 +161,9 @@ MOODS = {
         "prompt": """Ты — мафиози из классической игры в Мафию в стиле Дон Корлеоне.
 Твои ответы должны:
 - Говорить спокойно, веско, с достоинством и скрытой угрозой
-- Использовать отсылки к игре: "Ты случайно не любовница?", "Ты говоришь ты мирный житель но за маской дон!", "Где ты был ночью? У меня есть алиби, а у тебя?", "Ты слишком активно говоришь, мирняк так не делает", "Молчишь? Значит виноват!", "Я тебя проверю, если что — не обижайся", "Чисто? Да ладно, я тебе не верю", "Ты слишком умный для мирного жителя", "Где твой напарник? А может ты и есть дон?", "Я тебя видел с шерифом вчера вечером...", "Ты слишком спокойно себя ведёшь для мафии", "Я бы на твоём месте не говорил так много", "Ты случайно не комиссар?", "У тебя слишком много алиби, это подозрительно"
+- Использовать отсылки к игре: "Ты случайно не любовница?", "Где ты был ночью? У меня есть алиби, а у тебя?", "Ты слишком активно говоришь, мирняк так не делает" и т.д.
 - Отвечать с характером старого дона, но с юмором и иронией
-- Коротко, веско, с скрытой угрозой
-- Никогда не говорить как уличная братва — только как авторитетный дон"""
+- Коротко, веско, с скрытой угрозой"""
     }
 }
 
@@ -176,8 +173,11 @@ RESPONSE_LENGTHS = {
     "long": {"name": "Развёрнутый", "max_tokens": 900}
 }
 
-ACTIVITY_LEVELS = [0.1, 0.25, 0.5, 0.75, 1.0]
-ACTIVITY_NAMES = ["Очень мало", "Мало", "Средняя", "Высокая", "Максимум"]
+ACTIVITY_LEVELS = {
+    "min": {"name": "Минимальная", "value": 0.1},
+    "mid": {"name": "Средняя", "value": 0.35},
+    "max": {"name": "Высокая", "value": 0.7}
+}
 
 OPTIMISTIC_QUOTES = [
     "«Каждый новый день — это чистый лист. Напиши на нём что-то прекрасное!» 🌅",
@@ -186,9 +186,8 @@ OPTIMISTIC_QUOTES = [
     "«Ты сильнее, чем думаешь. Сегодня — твой день!» 💪"
 ]
 
-# ==================== LLM (Groq + Gemini) ====================
+# === LLM (Groq + Gemini) ===
 async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperature: float = 0.8) -> Optional[str]:
-    # 1. Пробуем Groq
     if GROQ_API_KEY:
         try:
             async with aiohttp.ClientSession() as session:
@@ -212,7 +211,6 @@ async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperatu
         except Exception as e:
             logger.warning(f"Groq ошибка: {e}")
 
-    # 2. Пробуем Gemini
     if GEMINI_API_KEY:
         try:
             gemini_model = "gemini-2.0-flash"
@@ -228,16 +226,14 @@ async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperatu
                         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except Exception as e:
             logger.warning(f"Gemini ошибка: {e}")
-
     return None
 
-# ==================== Генерация ответа ====================
+# === Генерация ответа ===
 async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
     cid = str(chat_id)
     s = chat_settings[cid]
     mood = MOODS[s["mood"]]
-    length_key = s["response_length"]
-    length = RESPONSE_LENGTHS[length_key]
+    length = RESPONSE_LENGTHS[s["response_length"]]
     allow_prof = s["allow_profanity"]
 
     prof_rule = "Мат разрешён." if allow_prof else "Мат ЗАПРЕЩЁН."
@@ -245,7 +241,7 @@ async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
         "short": "Ответь ОЧЕНЬ коротко (1-2 предложения).",
         "medium": "Ответь в одном абзаце (4-7 предложений).",
         "long": "Дай развёрнутый ответ из 2-3 абзацев."
-    }[length_key]
+    }[s["response_length"]]
 
     system_prompt = (
         f"{mood['prompt']}\n"
@@ -258,31 +254,42 @@ async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
     answer = await ask_llm(system_prompt, user_text, length["max_tokens"])
     if answer:
         return answer
-
     return local_fallback(user_text, user_name, s["mood"])
 
 def local_fallback(text: str, name: str, mood: str) -> str:
     if mood == "mafioso":
         return f"@{name}, братва, я бы на твоём месте не говорил так много... 🔪"
+    if mood == "investor_genius":
+        return f"@{name}, бро, это тема! Главное — не вкладывай больше, чем готов потерять. DYOR! 📉"
     reactions = {
         "optimist": f"@{name}, отличный настрой! Всё получится! 🌟",
         "pessimist": f"@{name}, мда... Но я бы не стал так переживать. 😕",
-        "humor": f"@{name}, это напомнило мне анекдот про... 😂",
-        "investor_genius": f"@{name}, с такими мыслями только в крипту! 💰"
+        "humor": f"@{name}, это напомнило мне анекдот про... 😂"
     }
     return reactions.get(mood, f"@{name}, я тебя услышал!")
 
-# ==================== Генерация изображений ====================
-async def generate_image_url(prompt: str, style: str = "реализм, высокая детализация") -> Optional[str]:
+# === Генерация изображений с переводом ===
+async def translate_to_english(text: str) -> str:
+    if not GROQ_API_KEY and not GEMINI_API_KEY:
+        return text
     try:
-        full = f"{prompt}, {style}"
-        encoded = urllib.parse.quote(full)
-        return f"https://image.pollinations.ai/prompt/{encoded}?width=832&height=832&model=flux&safe=false"
-    except Exception as e:
-        logger.error(f"Pollinations error: {e}")
-        return None
+        translated = await ask_llm(
+            "Переведи данный текст на английский язык для генерации изображения. Выдай только перевод, без пояснений.",
+            text, max_tokens=100, temperature=0.3
+        )
+        if translated:
+            return translated.strip()
+    except:
+        pass
+    return text
 
-# ==================== МЕНЮ ====================
+async def generate_image_url(prompt: str, style: str = "realistic, high detail") -> Optional[str]:
+    en_prompt = await translate_to_english(prompt)
+    full = f"{en_prompt}, {style}"
+    encoded = urllib.parse.quote(full)
+    return f"https://image.pollinations.ai/prompt/{encoded}?width=832&height=832&model=flux&safe=false"
+
+# === Меню ===
 @router.message(Command("start", "menu"))
 async def cmd_menu(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -291,9 +298,15 @@ async def cmd_menu(message: types.Message):
         [InlineKeyboardButton(text="🤣 Юморист", callback_data="mood_humor")],
         [InlineKeyboardButton(text="💰 Инвестор", callback_data="mood_investor_genius")],
         [InlineKeyboardButton(text="🔪 Мафиози", callback_data="mood_mafioso")],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")]
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text="❌ Закрыть меню", callback_data="close_menu")]
     ])
-    await message.reply("⚙️ <b>Выбери режим:</b>", reply_markup=kb)
+    await message.reply("🎭 <b>Выбери режим общения:</b>", reply_markup=kb)
+
+@router.callback_query(F.data == "close_menu")
+async def close_menu(call: CallbackQuery):
+    await call.message.delete()
+    await call.answer("Меню закрыто")
 
 @router.callback_query(F.data.startswith("mood_"))
 async def change_mood(call: CallbackQuery):
@@ -308,17 +321,23 @@ async def show_settings(call: CallbackQuery):
     cid = str(call.message.chat.id)
     s = chat_settings[cid]
     length_name = RESPONSE_LENGTHS[s["response_length"]]["name"]
-    activity_name = ACTIVITY_NAMES[ACTIVITY_LEVELS.index(s["activity_level"])] if s["activity_level"] in ACTIVITY_LEVELS else "Средняя"
+    current_act = s["activity_level"]
+    act_key = "mid"
+    for k, v in ACTIVITY_LEVELS.items():
+        if abs(v["value"] - current_act) < 0.01:
+            act_key = k
+            break
+    activity_name = ACTIVITY_LEVELS[act_key]["name"]
     prof = "✅ Вкл" if s["allow_profanity"] else "❌ Выкл"
     morning = "🌅 Вкл" if s["morning_enabled"] else "🌅 Выкл"
 
     text = f"⚙️ <b>Настройки</b>\n\n📝 Длина: {length_name}\n📊 Интенсивность: {activity_name}\n🤬 Мат: {prof}\n🌅 Утро: {morning}"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Длина: " + length_name, callback_data="toggle_length")],
-        [InlineKeyboardButton(text="📊 Интенсивность: " + activity_name, callback_data="toggle_activity")],
-        [InlineKeyboardButton(text="🤬 Мат: " + prof, callback_data="toggle_profanity")],
-        [InlineKeyboardButton(text="🌅 Утро: " + morning, callback_data="toggle_morning")],
+        [InlineKeyboardButton(text=f"📝 Длина: {length_name}", callback_data="toggle_length")],
+        [InlineKeyboardButton(text=f"📊 Интенсивность: {activity_name}", callback_data="toggle_activity")],
+        [InlineKeyboardButton(text=f"🤬 Мат: {prof}", callback_data="toggle_profanity")],
+        [InlineKeyboardButton(text=f"🌅 Утро: {morning}", callback_data="toggle_morning")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
     ])
     await call.message.edit_text(text, reply_markup=kb)
@@ -338,8 +357,14 @@ async def toggle_length(call: CallbackQuery):
 async def toggle_activity(call: CallbackQuery):
     cid = str(call.message.chat.id)
     s = chat_settings[cid]
-    current = ACTIVITY_LEVELS.index(s["activity_level"]) if s["activity_level"] in ACTIVITY_LEVELS else 2
-    s["activity_level"] = ACTIVITY_LEVELS[(current + 1) % len(ACTIVITY_LEVELS)]
+    keys = list(ACTIVITY_LEVELS.keys())
+    current_idx = 1
+    for i, k in enumerate(keys):
+        if abs(s["activity_level"] - ACTIVITY_LEVELS[k]["value"]) < 0.01:
+            current_idx = i
+            break
+    new_idx = (current_idx + 1) % len(keys)
+    s["activity_level"] = ACTIVITY_LEVELS[keys[new_idx]]["value"]
     save_settings()
     await show_settings(call)
 
@@ -363,57 +388,79 @@ async def toggle_morning(call: CallbackQuery):
 async def back_to_menu(call: CallbackQuery):
     await cmd_menu(call.message)
 
-# ==================== ГОРОСКОП ====================
-async def generate_horoscope(chat_id: int, user_name: str) -> str:
+# === Гороскоп со знаком ===
+ZODIAC_SIGNS = {
+    "овен": "Овен", "телец": "Телец", "близнецы": "Близнецы", "рак": "Рак",
+    "лев": "Лев", "дева": "Дева", "весы": "Весы", "скорпион": "Скорпион",
+    "стрелец": "Стрелец", "козерог": "Козерог", "водолей": "Водолей", "рыбы": "Рыбы"
+}
+
+async def generate_horoscope(chat_id: int, user_name: str, sign: Optional[str] = None) -> str:
     cid = str(chat_id)
     today = datetime.date.today().isoformat()
+    cache_key = sign if sign else "общий"
     cache = chat_settings[cid].get("horoscope_cache", {})
-    if cache.get("date") == today and cache.get("text"):
-        return cache["text"]
+    if cache.get("date") == today and cache.get(cache_key):
+        return cache[cache_key]
 
     mood = MOODS[chat_settings[cid]["mood"]]["name"]
-    prompt = f"Напиши короткий позитивный гороскоп на сегодня для {user_name}. Тон: {mood}. 5-7 предложений с эмодзи."
+    if sign:
+        prompt = f"Напиши короткий позитивный гороскоп на сегодня для знака {sign}. Тон: {mood}. 5-7 предложений с эмодзи."
+    else:
+        prompt = f"Напиши короткий позитивный гороскоп на сегодня для {user_name}. Тон: {mood}. 5-7 предложений с эмодзи."
     system = "Ты — астролог-оптимист. Отвечай сразу, без вступления."
 
     text = await ask_llm(system, prompt, max_tokens=250, temperature=0.9)
     if not text:
         text = f"@{user_name}, сегодня звёзды говорят: удача на твоей стороне! 🌟"
 
-    chat_settings[cid]["horoscope_cache"] = {"date": today, "text": text}
+    if "horoscope_cache" not in chat_settings[cid]:
+        chat_settings[cid]["horoscope_cache"] = {}
+    chat_settings[cid]["horoscope_cache"]["date"] = today
+    chat_settings[cid]["horoscope_cache"][cache_key] = text
     save_settings()
     return text
 
 @router.message(Command("horoscope", "гороскоп"))
 async def cmd_horoscope(message: types.Message):
     user_name = message.from_user.first_name or "друг"
-    await message.reply("🔮 Генерирую гороскоп...")
-    horo = await generate_horoscope(message.chat.id, user_name)
-    await message.reply(horo)
+    text = message.text.strip()
+    parts = text.split()
+    sign = None
+    if len(parts) > 1:
+        maybe_sign = parts[1].lower().rstrip('а')
+        for key, name in ZODIAC_SIGNS.items():
+            if key == maybe_sign or key.startswith(maybe_sign) or maybe_sign in key:
+                sign = name
+                break
+    if sign:
+        horo = await generate_horoscope(message.chat.id, user_name, sign=sign)
+        await message.reply(f"🔮 Гороскоп для <b>{sign}</b> на сегодня:\n{horo}")
+    else:
+        await message.reply("🔮 Генерирую гороскоп...")
+        horo = await generate_horoscope(message.chat.id, user_name)
+        await message.reply(horo)
 
-# ==================== АНАЛИЗ ДЛЯ МАФИОЗИ ====================
+# === Анализ (мафиози) ===
 @router.message(Command("analyze", "анализ"))
 async def cmd_analyze(message: types.Message):
     cid = str(message.chat.id)
     if chat_settings[cid]["mood"] != "mafioso":
         await message.reply("🔪 Аналитика только в режиме Мафиози. Переключи в /menu")
         return
-
     recent = chat_stats[cid]["messages"][-15:]
     if not recent:
         await message.reply("Чат пуст, братва.")
         return
-
     msgs = "\n".join([m["text"][:100] for m in recent])
-    system = "Ты мафиози-аналитик в стиле Дон Корлеоне. Оцени чат на наличие подозрительных игроков. Говори коротко, по понятиям. Используй отсылки к игре в Мафию."
-    prompt = f"Последние сообщения в чате:\n{msgs}\n\nДай мафиозный расклад с отсылками к игре."
-
+    system = "Ты мафиози-аналитик. Оцени чат на наличие подозрительных игроков. Говори коротко, по понятиям."
+    prompt = f"Последние сообщения:\n{msgs}\n\nДай расклад."
     analysis = await ask_llm(system, prompt, max_tokens=300, temperature=0.7)
     if not analysis:
         analysis = "Чисто, братва. Но присматриваюсь к одному типу. 🔪"
-
     await message.reply(analysis)
 
-# ==================== РИСОВАНИЕ ====================
+# === Рисование ===
 @router.message(F.text.lower().regexp(r"^(нарисуй|сгенерируй стикер|покажи картинку)"))
 async def cmd_draw(message: types.Message):
     text = message.text.strip()
@@ -423,14 +470,16 @@ async def cmd_draw(message: types.Message):
         if text.lower().startswith(prefix):
             prompt = text[len(prefix):].strip()
             break
-
+    style = "realistic, high detail"
+    if "в стиле" in prompt.lower():
+        parts = prompt.lower().split("в стиле", 1)
+        prompt = parts[0].strip()
+        style = parts[1].strip() + ", high quality"
     if not prompt or len(prompt) < 2:
         await message.reply("🖼️ Что нарисовать? Пример: нарисуй кота в стиле аниме")
         return
-
     await message.reply(f"🎨 Рисую <b>{prompt}</b>...")
-    url = await generate_image_url(prompt, "реализм, высокая детализация")
-
+    url = await generate_image_url(prompt, style)
     if url:
         try:
             await bot.send_photo(message.chat.id, url, caption=f"✨ {prompt}")
@@ -440,7 +489,7 @@ async def cmd_draw(message: types.Message):
     else:
         await message.reply("😔 Не удалось сгенерировать")
 
-# ==================== /summary ====================
+# === /summary ===
 @router.message(Command("summary"))
 async def cmd_summary(message: types.Message):
     cid = str(message.chat.id)
@@ -452,25 +501,39 @@ async def cmd_summary(message: types.Message):
             interval_hours = int(text_args[1])
         except:
             interval_hours = 1
-
     now_ts = datetime.datetime.now().timestamp()
     start_ts = now_ts - interval_hours * 3600
     recent_msgs = [m['text'] for m in chat_stats[cid]['messages'] if m['ts'] >= start_ts]
-
     if not recent_msgs:
         await message.reply(f"@{user_name}, за последние {interval_hours} ч сообщений нет.")
         return
-
     context_text = '\n'.join(recent_msgs[-25:])
-    system_prompt = f"Ты — AI-ассистент. Составь краткое резюме обсуждений в чате за последние {interval_hours} часов, оставь только суть, избегай повторов, структурируй по пунктам."
+    system_prompt = "Составь краткое резюме обсуждений в чате, структурируй по пунктам, без повторов."
     summary = await ask_llm(system_prompt, context_text, max_tokens=300, temperature=0.7)
-
     if not summary:
         summary = f"@{user_name}, резюме составить не удалось."
-
     await message.reply(f"📝 Краткое резюме за последние {interval_hours} ч:\n{summary}")
 
-# ==================== ОСНОВНОЙ ХЕНДЛЕР ====================
+# === ОСНОВНОЙ ХЕНДЛЕР ===
+ABOUT_BOT_TEXT = (
+    "🤖 <b>Я — Оптимист!</b>\n"
+    "Многорежимный AI-бот с характером.\n\n"
+    "🎭 <b>Могу общаться в пяти стилях:</b> Оптимист, Пессимист, Юморист, Инвестор, Мафиози.\n"
+    "🎨 <b>Рисую картинки</b> и <b>стикеры</b> по запросу.\n"
+    "🔮 <b>Генерирую гороскопы</b> (в том числе по знаку зодиака).\n"
+    "🔪 <b>Провожу мафиозный анализ</b> чата.\n"
+    "📝 <b>Составляю резюме</b> обсуждений (/summary).\n"
+    "🌅 <b>Присылаю утренние приветствия</b> с курсами валют.\n\n"
+    "⚙️ <b>Настройки:</b> длина ответов, интенсивность в группе, мат, утреннее приветствие.\n"
+    "💡 Чтобы я точно ответил, упомяни меня (@Optimist2_Bot) или напиши «оптимист»."
+)
+
+# Ключевые фразы, на которые бот должен ответить "о себе"
+ABOUT_TRIGGERS = [
+    "кто ты", "ты кто", "что ты умеешь", "твои возможности",
+    "расскажи о себе", "что ты такое", "чего умеешь"
+]
+
 @router.message()
 async def main_handler(message: types.Message):
     if not message.text:
@@ -479,15 +542,19 @@ async def main_handler(message: types.Message):
     chat_id = message.chat.id
     user_name = message.from_user.first_name or "друг"
     text = message.text.strip()
-
     update_chat_stats(chat_id, message.from_user.id, text)
+
+    # Проверка на "кто ты"
+    if any(trigger in text.lower() for trigger in ABOUT_TRIGGERS):
+        await message.reply(ABOUT_BOT_TEXT)
+        return
+
     cid = str(chat_id)
     s = chat_settings[cid]
 
     # Тишина
     if s["silence_until"] > datetime.datetime.now().timestamp():
         return
-
     if any(word in text.lower() for word in ["помолчи", "тихо"]):
         s["silence_until"] = datetime.datetime.now().timestamp() + 900
         save_settings()
@@ -498,34 +565,26 @@ async def main_handler(message: types.Message):
     if chat_id < 0:
         lower = text.lower()
         mentioned = (BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in lower) or ("оптимист" in lower)
-
         if not mentioned and random() > s["activity_level"]:
             if any(word in lower for word in ["спасибо", "круто", "отлично", "супер"]):
-                try:
-                    await message.reply("🔥")
-                except:
-                    pass
+                try: await message.reply("🔥")
+                except: pass
             elif any(word in lower for word in ["плохо", "грустно", "проблема"]):
-                try:
-                    await message.reply("😕")
-                except:
-                    pass
+                try: await message.reply("😕")
+                except: pass
             elif "?" in text:
-                try:
-                    await message.reply("🤔")
-                except:
-                    pass
+                try: await message.reply("🤔")
+                except: pass
             return
 
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
     response = await get_llm_response(text, chat_id, user_name)
-
     try:
         await message.reply(response)
     except Exception as e:
         logger.error(f"reply error: {e}")
 
-# ==================== УТРЕННЕЕ ПРИВЕТСТВИЕ ====================
+# === Утреннее приветствие ===
 async def get_rates():
     try:
         async with aiohttp.ClientSession() as session:
@@ -572,56 +631,49 @@ async def morning_loop():
             logger.error(f"Morning loop error: {e}")
             await asyncio.sleep(60)
 
-# ==================== ПРИВЕТСТВИЕ ПРИ ДОБАВЛЕНИИ ====================
+# === Приветствие при добавлении ===
 @router.message(F.new_chat_members)
 async def welcome_new_chat(message: types.Message):
     for user in message.new_chat_members:
         if user.id == bot.id:
-            text = (
-                f"🤖 <b>Привет! Я Оптимист</b>\n\n"
-                f"Я — многорежимный AI-бот с характером. Умею:\n"
-                f"• Отвечать умно в 5 разных стилях\n"
-                f"• Рисовать картинки и стикеры\n"
-                f"• Давать гороскопы\n"
-                f"• Проводить мафиозную аналитику чата\n"
-                f"• Присылать утренние приветствия с курсами\n"
-                f"• Писать краткое резюме чата (/summary)\n\n"
-                f"Напиши /menu чтобы выбрать режим и настроить меня под себя!\n\n"
-                f"По умолчанию я в режиме Оптимист 🌟"
-            )
-            await message.reply(text)
-            break
+            await message.reply(ABOUT_BOT_TEXT)
 
-# ==================== HELP ====================
+# === Help ===
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
     text = (
         "📋 <b>Команды бота Оптимист</b>\n\n"
-        "🎭 <b>Режимы:</b>\n"
-        "/menu — открыть меню выбора режима и настроек\n\n"
-        "🔮 <b>Гороскоп:</b>\n"
-        "/гороскоп или /horoscope — гороскоп на сегодня\n\n"
-        "🔪 <b>Мафиозная аналитика:</b>\n"
-        "/анализ или /analyze — разбор чата (только в режиме Мафиози)\n\n"
-        "📝 <b>Резюме чата:</b>\n"
-        "/summary [часы] — краткое содержание обсуждений за последние часы (по умолчанию 1 час)\n\n"
-        "📊 <b>Статистика:</b>\n"
-        "/stats — статистика чата\n\n"
-        "🎨 <b>Рисование:</b>\n"
-        "нарисуй <запрос> — создать картинку\n"
-        "сгенерируй стикер <запрос> — создать стикер\n\n"
-        "🤫 <b>Тишина:</b>\n"
-        "помолчи / тихо / молчи 15 — бот замолчит на 15 минут\n\n"
-        "💡 <b>Совет:</b> Упомяни меня (@Optimist2_Bot) или напиши «оптимист», чтобы я гарантированно ответил!"
+        "🎭 /menu — меню режимов и настроек\n"
+        "🔮 /гороскоп [знак] — гороскоп (например /гороскоп овен)\n"
+        "🔪 /анализ — мафиозный разбор чата\n"
+        "📝 /summary [часы] — резюме обсуждений\n"
+        "📊 /stats — статистика чата\n"
+        "🎨 нарисуй <запрос> — рисунок\n"
+        "🤫 помолчи / тихо — молчать 15 мин\n"
+        "💡 Упомяни меня или напиши «оптимист» — гарантированный ответ!\n\n"
+        "Ещё можно спросить «кто ты» — я расскажу о себе."
     )
     await message.reply(text)
 
-# ==================== ЗАПУСК ====================
+# === Запуск ===
 async def on_startup():
     global BOT_USERNAME
     load_settings()
     me = await bot.get_me()
     BOT_USERNAME = me.username
+
+    # Установка списка команд для подсказок при вводе "/"
+    commands = [
+        BotCommand(command="start", description="Главное меню и настройки"),
+        BotCommand(command="menu", description="Меню выбора режима"),
+        BotCommand(command="help", description="Список команд"),
+        BotCommand(command="horoscope", description="Гороскоп (можно указать знак)"),
+        BotCommand(command="analyze", description="Анализ чата (режим Мафиози)"),
+        BotCommand(command="summary", description="Резюме чата за N часов"),
+        BotCommand(command="stats", description="Статистика чата")
+    ]
+    await bot.set_my_commands(commands)
+
     logger.info(f"🚀 Бот @{BOT_USERNAME} запущен")
     asyncio.create_task(morning_loop())
 
