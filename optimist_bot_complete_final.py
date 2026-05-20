@@ -4,7 +4,7 @@
 
 Функции:
 - Groq + Gemini fallback для ответов.
-- FusionBrain для генерации изображений + Pollinations fallback.
+- Pollinations FLUX / AI Horde SD / Gemini для генерации изображений с авто-fallback и скрытым улучшением промпта.
 - Настройки через inline меню, менять могут только админы групп.
 - Режим «только по запросу» и режим сна «Оптимист спи/спать».
 - Точная интенсивность активности: 0%, 10%, 20% ... 100%.
@@ -12,7 +12,8 @@
 - Тематические стикеры из чата: бот запоминает стикеры и может отправлять их по контексту.
 - /summary — нейтральное резюме обсуждения за 1/3/6/24 часа или произвольное число часов.
 - /analyze — отдельная мафиозная аналитика как ведущий игры в Мафию.
-- Утреннее приветствие с курсами валют с несколькими fallback-источниками.
+- Утреннее приветствие и команда /rates с курсами валют с несколькими fallback-источниками.
+- Рейтинг отношений в чате и команда /myrating / «мой рейтинг».
 """
 
 import os
@@ -54,12 +55,16 @@ load_dotenv()
 TG_TOKEN = os.getenv("TG_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-FUSION_BRAIN_API_KEY = os.getenv("FUSION_BRAIN_API_KEY")
-FUSION_BRAIN_SECRET_KEY = os.getenv("FUSION_BRAIN_SECRET_KEY")
-
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "pollinations").lower().strip()
+IMAGE_FALLBACK_PROVIDER = os.getenv("IMAGE_FALLBACK_PROVIDER", "horde,pollinations").lower().strip()
+POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux").lower().strip()
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+AI_HORDE_API_KEY = os.getenv("AI_HORDE_API_KEY", "0000000000")
+AI_HORDE_MODEL = os.getenv("AI_HORDE_MODEL", "stable_diffusion_xl")
+AI_HORDE_TIMEOUT_SECONDS = int(os.getenv("AI_HORDE_TIMEOUT_SECONDS", "120"))
 MORNING_TZ = os.getenv("MORNING_TZ", "Europe/Moscow")
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "8"))
 MENU_DELETE_SECONDS = int(os.getenv("MENU_DELETE_SECONDS", "2"))
@@ -188,7 +193,15 @@ def save_settings():
         logger.error(f"Ошибка сохранения настроек: {e}")
 
 
-def update_chat_stats(chat_id: int, user_id: int, text: str, user_name: str = ""):
+def update_chat_stats(
+    chat_id: int,
+    user_id: int,
+    text: str,
+    user_name: str = "",
+    username: str = "",
+    reply_to_user_id: Optional[int] = None,
+    reply_to_user_name: str = "",
+):
     cid = str(chat_id)
     stats = chat_stats[cid]
     today = datetime.date.today().isoformat()
@@ -200,7 +213,10 @@ def update_chat_stats(chat_id: int, user_id: int, text: str, user_name: str = ""
     stats["messages"].append({
         "text": text[:1200],
         "user": user_name[:80],
+        "username": username[:80],
         "user_id": user_id,
+        "reply_to_user_id": reply_to_user_id,
+        "reply_to_user": reply_to_user_name[:80],
         "ts": datetime.datetime.now().timestamp(),
     })
     if len(stats["messages"]) > SUMMARY_MAX_MESSAGES:
@@ -226,7 +242,12 @@ MOODS = {
     "investor_genius": {
         "name": "💰 Гений инвестиций",
         "emoji": "📈",
-        "prompt": "Ты — эксперт по хайп-проектам, криптовалютам и инвестициям. Говори про риски, FOMO, токеномику, памп/дамп. Добавляй иронию, но не давай финансовых гарантий.",
+        "prompt": """Ты — тёмщик и лидер мнений в мире хайп-проектов, крипты, DeFi и рискованных инвест-историй.
+Твоя роль: разбирать маркетинг проектов, видеть признаки пирамид и скама, объяснять токеномику, реферальные механики, FOMO, KYC, листинги, памп/дамп, вайтлисты, AMA и разгоны.
+Говори живо, дерзко и с иронией: «бро», «инвестор», «тема мутная», «маркетинг жирный», «риск пахнет скамом», «DYOR».
+Давай практичные советы по проверке проекта: команда, аудит, ликвидность, vesting, дорожная карта, юридика, вывод средств, отзывы.
+Не обещай прибыль, не давай гарантии и не призывай бездумно вкладываться. Всегда подчёркивай риски и что это не финансовая рекомендация.
+Не повторяй вопрос пользователя.""",
     },
     "mafioso": {
         "name": "🔪 Мафиози",
@@ -559,78 +580,210 @@ async def translate_to_english_for_image(text: str) -> str:
     return translated.strip() if translated else text
 
 
-async def fusionbrain_generate_image(prompt: str, style: str = "") -> Optional[bytes]:
-    if not FUSION_BRAIN_API_KEY or not FUSION_BRAIN_SECRET_KEY:
+async def gemini_generate_image_bytes(prompt: str, style: str = "") -> Optional[bytes]:
+    """Генерация изображения через Gemini/Nano Banana. Возвращает bytes PNG/JPEG или None."""
+    if not GEMINI_API_KEY:
         return None
 
-    base_url = "https://api-key.fusionbrain.ai/"
-    headers = {
-        "X-Key": f"Key {FUSION_BRAIN_API_KEY}",
-        "X-Secret": f"Secret {FUSION_BRAIN_SECRET_KEY}",
+    en_prompt = await translate_to_english_for_image(prompt)
+    style_text = style or "high quality, detailed, square image"
+    full_prompt = (
+        f"Create one image from this prompt: {en_prompt}. "
+        f"Style: {style_text}. Square composition, high quality, no text unless explicitly requested."
+    )
+
+    model_candidates = []
+    for model in [GEMINI_IMAGE_MODEL, "gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"]:
+        if model and model not in model_candidates:
+            model_candidates.append(model)
+
+    payload = {
+        "contents": [{"parts": [{"text": full_prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
-    query = prompt if not style else f"{prompt}, {style}"
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(base_url + "key/api/v1/pipelines", headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"FusionBrain pipelines status {resp.status}")
-                    return None
-                pipelines = await resp.json()
-                if not pipelines:
-                    return None
-                pipeline_id = pipelines[0].get("id")
+    async with aiohttp.ClientSession() as session:
+        for model in model_candidates:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            try:
+                async with session.post(
+                    url,
+                    headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=90),
+                ) as resp:
+                    raw = await resp.text()
+                    if resp.status != 200:
+                        logger.warning(f"Gemini image {model} status {resp.status}: {raw[:300]}")
+                        continue
+                    data = json.loads(raw)
 
-            params = {
-                "type": "GENERATE",
-                "numImages": 1,
-                "width": 1024,
-                "height": 1024,
-                "generateParams": {"query": query},
-            }
-            form = aiohttp.FormData()
-            form.add_field("pipeline_id", str(pipeline_id))
-            form.add_field("params", json.dumps(params), content_type="application/json")
-
-            async with session.post(base_url + "key/api/v1/pipeline/run", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"FusionBrain run status {resp.status}: {(await resp.text())[:200]}")
-                    return None
-                data = await resp.json()
-                uuid = data.get("uuid")
-                if not uuid:
-                    return None
-
-            status_paths = [
-                f"key/api/v1/pipeline/status/{uuid}",
-                f"key/api/v1/text2image/status/{uuid}",
-            ]
-            for _ in range(20):
-                await asyncio.sleep(3)
-                for path in status_paths:
-                    async with session.get(base_url + path, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                        if resp.status != 200:
+                for cand in data.get("candidates", []):
+                    content = cand.get("content") or {}
+                    for part in content.get("parts", []):
+                        inline_data = part.get("inlineData") or part.get("inline_data")
+                        if not inline_data:
                             continue
-                        st = await resp.json()
-                        status = st.get("status")
-                        if status == "DONE":
-                            files = (st.get("result") or {}).get("files") or []
-                            if files:
-                                return base64.b64decode(files[0])
-                        if status == "FAIL":
-                            logger.warning("FusionBrain generation failed")
-                            return None
-        return None
+                        image_b64 = inline_data.get("data")
+                        if image_b64:
+                            return base64.b64decode(image_b64)
+                logger.warning(f"Gemini image {model}: ответ без inlineData")
+            except Exception as e:
+                logger.warning(f"Gemini image {model} error: {e}")
+    return None
+
+
+async def enhance_image_prompt(prompt: str, style: str = "", sticker_mode: bool = False) -> str:
+    """Невидимо улучшает запрос пользователя для генерации картинки.
+
+    Важно: улучшенный prompt не показывается пользователю.
+    Сначала пробуем Groq/Gemini, потом бесплатный Pollinations text, потом локальный усилитель.
+    """
+    sticker_rule = "It must look like a Telegram sticker, clean silhouette, expressive emotion, simple background." if sticker_mode else ""
+    base_quality = (
+        "masterpiece, high quality, detailed, sharp focus, professional composition, "
+        "beautiful lighting, rich colors, clean background, no watermark, no logo, no extra text"
+    )
+    system = (
+        "You are a professional prompt engineer for FLUX/Stable Diffusion/Imagen. "
+        "Translate the user idea to English and rewrite it as one powerful image prompt. "
+        "Add concrete visual details: subject, composition, lighting, camera, mood, background, quality. "
+        "Do not add text/watermarks unless explicitly requested. Return only the final prompt."
+    )
+    user = f"User idea: {prompt}\nStyle: {style}\nExtra: {sticker_rule}"
+
+    improved = await ask_llm(system, user, max_tokens=260, temperature=0.25)
+    if improved:
+        improved = improved.strip().strip('"')
+        if 10 <= len(improved) <= 1200:
+            final_prompt = f"{improved}, {base_quality}"
+            logger.info(f"Image prompt improved by LLM: {final_prompt[:300]}")
+            return final_prompt
+
+    # Бесплатная попытка улучшить/перевести через Pollinations text API без ключа.
+    try:
+        polli_task = (
+            "Translate to English and improve this image prompt for FLUX/Stable Diffusion. "
+            "Return only the final prompt, no explanations. User idea: " + prompt +
+            f". Style: {style}. {sticker_rule}"
+        )
+        url = "https://text.pollinations.ai/" + urllib.parse.quote(polli_task)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 200:
+                    text = (await resp.text()).strip().strip('"')
+                    if 10 <= len(text) <= 1200 and "<!DOCTYPE" not in text:
+                        final_prompt = f"{text}, {base_quality}"
+                        logger.info(f"Image prompt improved by Pollinations text: {final_prompt[:300]}")
+                        return final_prompt
     except Exception as e:
-        logger.warning(f"FusionBrain error: {e}")
-        return None
+        logger.info(f"Pollinations prompt improve failed: {e}")
+
+    en_prompt = await translate_to_english_for_image(prompt)
+    final_prompt = (
+        f"Subject: {en_prompt}. Style: {style or 'realistic, cinematic'}. "
+        f"{sticker_rule} {base_quality}"
+    )
+    logger.info(f"Image prompt improved locally: {final_prompt[:300]}")
+    return final_prompt
 
 
 async def pollinations_image_url(prompt: str, style: str = "realistic, high detail") -> str:
-    en_prompt = await translate_to_english_for_image(prompt)
-    full = f"{en_prompt}, {style}"
+    """Бесплатный fallback: URL-картинка Pollinations/FLUX без API-ключа."""
+    full = f"{prompt}, {style}"
     encoded = urllib.parse.quote(full)
-    return f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&model=flux&safe=false&nologo=true"
+    return f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&model={POLLINATIONS_IMAGE_MODEL}&safe=false&nologo=true&enhance=true"
+
+
+async def ai_horde_generate_image_bytes(prompt: str, style: str = "") -> Optional[bytes]:
+    """Бесплатная community-генерация через AI Horde / Stable Diffusion. Может быть медленной."""
+    payload = {
+        "prompt": f"{prompt}, {style or 'high quality, detailed'}",
+        "params": {
+            "n": 1,
+            "width": 1024,
+            "height": 1024,
+            "steps": 28,
+            "cfg_scale": 7.5,
+            "sampler_name": "k_euler_a",
+            "karras": True,
+        },
+        "nsfw": False,
+        "trusted_workers": False,
+        "models": [AI_HORDE_MODEL] if AI_HORDE_MODEL else [],
+        "r2": True,
+    }
+    headers = {
+        "apikey": AI_HORDE_API_KEY or "0000000000",
+        "Client-Agent": "OptimistBot:1.0:https://t.me/Optimist2_Bot",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://aihorde.net/api/v2/generate/async", json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                raw = await resp.text()
+                if resp.status not in {200, 202}:
+                    logger.warning(f"AI Horde submit {resp.status}: {raw[:300]}")
+                    return None
+                req = json.loads(raw)
+                req_id = req.get("id")
+                if not req_id:
+                    return None
+
+            deadline = datetime.datetime.now().timestamp() + AI_HORDE_TIMEOUT_SECONDS
+            while datetime.datetime.now().timestamp() < deadline:
+                await asyncio.sleep(5)
+                async with session.get(f"https://aihorde.net/api/v2/generate/status/{req_id}", headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    raw = await resp.text()
+                    if resp.status != 200:
+                        logger.warning(f"AI Horde status {resp.status}: {raw[:200]}")
+                        continue
+                    data = json.loads(raw)
+                generations = data.get("generations") or []
+                if generations:
+                    img = generations[0].get("img")
+                    if not img:
+                        return None
+                    if img.startswith("http://") or img.startswith("https://"):
+                        async with session.get(img, timeout=aiohttp.ClientTimeout(total=30)) as img_resp:
+                            if img_resp.status == 200:
+                                return await img_resp.read()
+                    return base64.b64decode(img)
+                if data.get("done") is True:
+                    return None
+    except Exception as e:
+        logger.warning(f"AI Horde image error: {e}")
+    return None
+
+
+async def generate_image(prompt: str, style: str = "", sticker_mode: bool = False) -> Tuple[Optional[bytes], Optional[str], str]:
+    """Единая точка генерации. Возвращает (bytes, url, provider_name)."""
+    improved_prompt = await enhance_image_prompt(prompt, style, sticker_mode)
+    providers = []
+    raw_providers = []
+    for chunk in [IMAGE_PROVIDER, IMAGE_FALLBACK_PROVIDER, "pollinations"]:
+        raw_providers.extend([p.strip() for p in (chunk or "").split(",")])
+    for provider in raw_providers:
+        provider = provider.lower().strip()
+        if provider and provider not in providers:
+            providers.append(provider)
+
+    for provider in providers:
+        if provider in {"pollinations", "pollination", "flux", "sd", "stable-diffusion"}:
+            try:
+                url = await pollinations_image_url(improved_prompt, style or "high quality, detailed")
+                return None, url, f"Pollinations/{POLLINATIONS_IMAGE_MODEL}"
+            except Exception as e:
+                logger.warning(f"Pollinations image error: {e}")
+        elif provider in {"horde", "ai_horde", "stablehorde", "stable-horde"}:
+            image_bytes = await ai_horde_generate_image_bytes(improved_prompt, style)
+            if image_bytes:
+                return image_bytes, None, f"AI Horde/{AI_HORDE_MODEL}"
+        elif provider in {"gemini", "nano", "nanobanana", "nano-banana"}:
+            image_bytes = await gemini_generate_image_bytes(improved_prompt, style)
+            if image_bytes:
+                return image_bytes, None, "Gemini"
+    return None, None, "none"
 
 
 DRAW_PREFIXES = [
@@ -687,6 +840,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💰 Инвестор", callback_data="mood_investor_genius")],
         [InlineKeyboardButton(text="🔪 Мафиози", callback_data="mood_mafioso")],
         [InlineKeyboardButton(text="📝 Резюме чата", callback_data="summary_menu")],
+        [InlineKeyboardButton(text="💱 Курсы валют", callback_data="rates_menu"), InlineKeyboardButton(text="🤝 Мой рейтинг", callback_data="my_rating_menu")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
         [InlineKeyboardButton(text="❔ Help", callback_data="help_menu"), InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")],
     ])
@@ -768,9 +922,15 @@ HELP_TEXT = (
     "/menu — меню режимов и настроек\n"
     "/help — список команд\n"
     "/stats — статистика чата\n"
+    "/rates или /rate — реальные курсы BTC/USDT/USD/EUR к ₽\n"
+    "/myrating — мой рейтинг отношений в чате\n"
+    "/rating — общий рейтинг отношений чата\n"
     "/summary [1/3/6/24] — нейтральное резюме обсуждения\n"
     "/analyze или /анализ — мафиозный анализ как ведущий игры\n"
     "/horoscope или /гороскоп [знак] — гороскоп\n\n"
+    "💬 <b>Текстовые команды:</b>\n"
+    "курс / курсы / курс валют — показать курсы\n"
+    "мой рейтинг / рейтинг отношений / рейтинг чата — рейтинг общения\n\n"
     "🎨 <b>Рисование:</b>\n"
     "нарисуй кота в киберпанке\n"
     "сгенерируй стикер грустный хомяк\n"
@@ -957,6 +1117,35 @@ async def summary_callback(call: CallbackQuery):
         [InlineKeyboardButton(text="🔙 Периоды", callback_data="summary_menu"), InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")]
     ]))
 
+@router.callback_query(F.data == "rates_menu")
+async def rates_menu_callback(call: CallbackQuery):
+    await call.answer("Получаю курсы...")
+    rates = await get_rates()
+    await call.message.edit_text(format_rates_message(rates), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="rates_menu")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu"), InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")],
+    ]))
+
+
+@router.callback_query(F.data == "my_rating_menu")
+async def my_rating_menu_callback(call: CallbackQuery):
+    await call.answer("Считаю рейтинг...")
+    text = await build_relationship_rating(call.message.chat.id, target_user_id=call.from_user.id)
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Рейтинг чата", callback_data="chat_rating_menu")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu"), InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")],
+    ]))
+
+
+@router.callback_query(F.data == "chat_rating_menu")
+async def chat_rating_menu_callback(call: CallbackQuery):
+    await call.answer("Считаю рейтинг чата...")
+    text = await build_relationship_rating(call.message.chat.id, target_user_id=None)
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤝 Мой рейтинг", callback_data="my_rating_menu")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu"), InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")],
+    ]))
+
 # ==================== КОМАНДЫ ====================
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
@@ -978,6 +1167,160 @@ async def cmd_stats(message: types.Message):
         f"Стикеров запомнено: <b>{len(chat_stickers[cid])}</b>"
     )
     await message.reply(text)
+
+# ==================== КУРСЫ И РЕЙТИНГ ОТНОШЕНИЙ ====================
+def format_rates_message(rates: Dict[str, Any]) -> str:
+    source = ", ".join(dict.fromkeys(rates.get("source", []))) or "источники временно недоступны"
+    if all(rates.get(k) is None for k in ["btc", "usdt", "usd", "eur"]):
+        return "💱 <b>Курсы валют</b>\n\nНе удалось получить актуальные данные. Попробуй позже."
+    return (
+        "💱 <b>Курсы валют</b>\n\n"
+        f"• BTC: <b>{fmt_money(rates.get('btc'), 0)}</b> ₽\n"
+        f"• USDT: <b>{fmt_money(rates.get('usdt'))}</b> ₽\n"
+        f"• USD: <b>{fmt_money(rates.get('usd'))}</b> ₽\n"
+        f"• EUR: <b>{fmt_money(rates.get('eur'))}</b> ₽\n\n"
+        f"<i>Источник: {html_escape(source)}</i>"
+    )
+
+
+@router.message(Command("rates", "rate"))
+async def cmd_rates(message: types.Message):
+    status = await message.reply("💱 Получаю актуальные курсы...")
+    rates = await get_rates()
+    try:
+        await status.edit_text(format_rates_message(rates))
+    except Exception:
+        await message.reply(format_rates_message(rates))
+
+
+def is_rates_request_text(text: str) -> bool:
+    lower = (text or "").lower().strip()
+    lower = re.sub(r"^@\w+\s+", "", lower)
+    lower = re.sub(r"^(оптимист|бот)[,\s:;-]+", "", lower)
+    lower = re.sub(r"[?!.,;:]+$", "", lower).strip()
+    return lower in {"курс", "курсы", "курс валют", "курсы валют", "валюта", "валюты"}
+
+
+@router.message(F.text.lower().regexp(r"^\s*(?:@\w+\s+)?(?:(?:оптимист|бот)[,\s:;-]+)?(?:курс|курсы|валюта|валюты)(?:\s+валют)?[?!.,;:\s]*$"))
+async def text_rates(message: types.Message):
+    await cmd_rates(message)
+
+
+def message_sentiment_score(text: str) -> int:
+    words = set(re.findall(r"[а-яa-zё]+", (text or "").lower()))
+    return len(words & POSITIVE_WORDS) - len(words & NEGATIVE_WORDS)
+
+
+def relationship_raw_report(chat_id: int, target_user_id: Optional[int] = None, hours: int = 168) -> Tuple[str, int]:
+    messages = get_recent_messages(chat_id, hours=hours, limit=900)
+    if not messages:
+        return "Данных пока нет: бот ещё не накопил историю общения.", 0
+
+    users: Dict[int, Dict[str, Any]] = {}
+    interactions: Dict[Tuple[int, int], Dict[str, int]] = defaultdict(lambda: {"replies": 0, "positive": 0, "negative": 0, "questions": 0})
+
+    for m in messages:
+        uid = m.get("user_id")
+        if not uid:
+            continue
+        uid = int(uid)
+        users.setdefault(uid, {"name": m.get("user") or f"user_{uid}", "username": m.get("username") or "", "messages": 0, "pos": 0, "neg": 0, "questions": 0})
+        users[uid]["messages"] += 1
+        score = message_sentiment_score(m.get("text", ""))
+        if score > 0:
+            users[uid]["pos"] += 1
+        elif score < 0:
+            users[uid]["neg"] += 1
+        if "?" in (m.get("text") or ""):
+            users[uid]["questions"] += 1
+
+        rid = m.get("reply_to_user_id")
+        if rid and int(rid) != uid:
+            rid = int(rid)
+            users.setdefault(rid, {"name": m.get("reply_to_user") or f"user_{rid}", "username": "", "messages": 0, "pos": 0, "neg": 0, "questions": 0})
+            rel = interactions[(uid, rid)]
+            rel["replies"] += 1
+            if score > 0:
+                rel["positive"] += 1
+            elif score < 0:
+                rel["negative"] += 1
+            if "?" in (m.get("text") or ""):
+                rel["questions"] += 1
+
+    def display(uid: int) -> str:
+        u = users.get(uid, {})
+        username = u.get("username")
+        if username:
+            return f"@{username}"
+        return html_escape(u.get("name") or f"user_{uid}")
+
+    if target_user_id:
+        u = users.get(target_user_id)
+        if not u:
+            return "По тебе пока мало данных: напиши пару сообщений и пообщайся с участниками.", 0
+        outgoing = [(to, data) for (frm, to), data in interactions.items() if frm == target_user_id]
+        incoming = [(frm, data) for (frm, to), data in interactions.items() if to == target_user_id]
+        all_rel = outgoing + incoming
+        pos_candidates = sorted(all_rel, key=lambda x: (x[1]["positive"], x[1]["replies"]), reverse=True)[:3]
+        neg_candidates = sorted(all_rel, key=lambda x: (x[1]["negative"], x[1]["replies"]), reverse=True)[:3]
+        adequacy = 70 + min(15, u["pos"] * 2) - min(25, u["neg"] * 3) + min(10, len(all_rel))
+        adequacy = max(1, min(100, adequacy))
+        raw = [
+            f"Целевой пользователь: {display(target_user_id)}",
+            f"Сообщений: {u['messages']}; позитивных сигналов: {u['pos']}; негативных сигналов: {u['neg']}; вопросов: {u['questions']}",
+            f"Шутливый индекс адекватности: {adequacy}/100",
+            "Позитивные связи: " + (", ".join([f"{display(uid)} replies={d['replies']} pos={d['positive']}" for uid, d in pos_candidates]) or "пока не видно"),
+            "Напряжённые связи: " + (", ".join([f"{display(uid)} replies={d['replies']} neg={d['negative']}" for uid, d in neg_candidates if d['negative'] > 0]) or "явного негатива не видно"),
+        ]
+        return "\n".join(raw), len(messages)
+
+    top_users = sorted(users.items(), key=lambda x: x[1]["messages"], reverse=True)[:8]
+    top_pairs = sorted(interactions.items(), key=lambda x: x[1]["replies"], reverse=True)[:8]
+    raw = ["Общий рейтинг чата:"]
+    raw.append("Активность: " + "; ".join([f"{display(uid)}={u['messages']}" for uid, u in top_users]))
+    raw.append("Кто чаще отвечает друг другу: " + ("; ".join([f"{display(a)} → {display(b)}: {d['replies']}" for (a, b), d in top_pairs]) or "пока мало reply-связей"))
+    return "\n".join(raw), len(messages)
+
+
+async def build_relationship_rating(chat_id: int, target_user_id: Optional[int] = None) -> str:
+    raw, count = relationship_raw_report(chat_id, target_user_id=target_user_id)
+    if count == 0:
+        return f"🤝 <b>Рейтинг отношений</b>\n\n{raw}"
+    system = (
+        "Ты нейтральный аналитик группового чата. По статистике общения сделай аккуратный, шутливый, но адекватный рейтинг отношений. "
+        "Не ставь диагнозы, не утверждай реальные чувства, говори 'похоже', 'по переписке видно', 'игровой индекс'. "
+        "Выдели: адекватность, позитивные связи, возможные напряжённые связи, короткий совет. Формат Telegram HTML."
+    )
+    report = await ask_llm(system, raw, max_tokens=600, temperature=0.45)
+    if not report:
+        report = raw
+    return f"🤝 <b>Рейтинг отношений</b>\n<i>Это шутливый анализ по сообщениям, не реальная психология.</i>\n\n{html_escape(report)}"
+
+
+@router.message(Command("myrating", "rating"))
+async def cmd_my_rating(message: types.Message):
+    first = (message.text or "").split()[0].lower()
+    target = message.from_user.id if first.startswith("/myrating") else None
+    await message.reply(await build_relationship_rating(message.chat.id, target_user_id=target))
+
+
+def is_rating_request_text(text: str) -> Optional[str]:
+    lower = (text or "").lower().strip()
+    lower = re.sub(r"^@\w+\s+", "", lower)
+    lower = re.sub(r"^(оптимист|бот)[,\s:;-]+", "", lower)
+    lower = re.sub(r"[?!.,;:]+$", "", lower).strip()
+    if lower in {"мой рейтинг", "моя оценка", "мой рейтинг отношений"}:
+        return "my"
+    if lower in {"рейтинг", "рейтинг отношений", "рейтинг чата", "общий рейтинг"}:
+        return "chat"
+    return None
+
+
+@router.message(F.text.lower().regexp(r"^\s*(?:@\w+\s+)?(?:(?:оптимист|бот)[,\s:;-]+)?(?:мой рейтинг|моя оценка|мой рейтинг отношений|рейтинг|рейтинг отношений|рейтинг чата|общий рейтинг)[?!.,;:\s]*$"))
+async def text_relationship_rating(message: types.Message):
+    mode = is_rating_request_text(message.text or "")
+    target = message.from_user.id if mode == "my" else None
+    await message.reply(await build_relationship_rating(message.chat.id, target_user_id=target))
 
 # ==================== SUMMARY И ANALYZE ====================
 async def build_summary(chat_id: int, hours: int) -> str:
@@ -1079,22 +1422,33 @@ async def cmd_draw(message: types.Message):
         await message.reply("🖼️ Что нарисовать? Пример: <code>нарисуй кота в стиле киберпанк</code>")
         return
 
-    await message.reply(f"🎨 Рисую: <b>{html_escape(prompt)}</b>")
-    image_bytes = await fusionbrain_generate_image(prompt, style)
+    status = await message.reply(f"🎨 Рисую: <b>{html_escape(prompt)}</b>")
+    image_bytes, image_url, provider = await generate_image(prompt, style, sticker_mode=sticker_mode)
+
     if image_bytes:
         try:
             img = BufferedInputFile(image_bytes, filename="optimist_image.png")
             await bot.send_photo(message.chat.id, img, caption=f"✨ {html_escape(prompt)}")
+            try:
+                await status.delete()
+            except Exception:
+                pass
             return
         except Exception as e:
-            logger.warning(f"Ошибка отправки FusionBrain image: {e}")
+            logger.warning(f"Ошибка отправки Gemini image: {e}")
 
-    try:
-        url = await pollinations_image_url(prompt, style)
-        await bot.send_photo(message.chat.id, url, caption=f"✨ {html_escape(prompt)}")
-    except Exception as e:
-        logger.error(f"Ошибка генерации/отправки картинки: {e}")
-        await message.reply("😔 Не получилось сгенерировать изображение. Попробуй другой запрос.")
+    if image_url:
+        try:
+            await bot.send_photo(message.chat.id, image_url, caption=f"✨ {html_escape(prompt)}")
+            try:
+                await status.delete()
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            logger.error(f"Ошибка отправки Pollinations image: {e}")
+
+    await message.reply("😔 Не получилось сгенерировать изображение. Попробуй другой запрос или проверь GEMINI_API_KEY.")
 
 # ==================== СТИКЕРЫ ====================
 @router.message(F.sticker)
@@ -1124,7 +1478,30 @@ def is_wake_command(text: str) -> bool:
 async def main_handler(message: types.Message):
     if not message.text:
         return
-    if message.text.startswith("/"):
+
+    # Страховка: если по какой-то причине aiogram Command/Text handler не сработал,
+    # не отдаём служебные команды в LLM, а выполняем их здесь.
+    raw_text = message.text.strip()
+    lower_raw = raw_text.lower()
+    command = lower_raw.split()[0].split("@")[0] if lower_raw.startswith("/") else ""
+    if command in {"/rates", "/rate"}:
+        await cmd_rates(message)
+        return
+    if command in {"/myrating", "/rating"}:
+        await cmd_my_rating(message)
+        return
+    if command == "/help":
+        await cmd_help(message)
+        return
+    if command:
+        return
+    if is_rates_request_text(raw_text):
+        await cmd_rates(message)
+        return
+    rating_mode = is_rating_request_text(raw_text)
+    if rating_mode:
+        target = message.from_user.id if rating_mode == "my" else None
+        await message.reply(await build_relationship_rating(message.chat.id, target_user_id=target))
         return
 
     chat_id = message.chat.id
@@ -1134,7 +1511,20 @@ async def main_handler(message: types.Message):
     lower = text.lower()
     s = chat_settings[cid]
 
-    update_chat_stats(chat_id, message.from_user.id, text, user_name=user_name)
+    reply_to_user_id = None
+    reply_to_user_name = ""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        reply_to_user_id = message.reply_to_message.from_user.id
+        reply_to_user_name = message.reply_to_message.from_user.first_name or "участник"
+    update_chat_stats(
+        chat_id,
+        message.from_user.id,
+        text,
+        user_name=user_name,
+        username=message.from_user.username or "",
+        reply_to_user_id=reply_to_user_id,
+        reply_to_user_name=reply_to_user_name,
+    )
 
     if any(trigger in lower for trigger in ABOUT_TRIGGERS):
         await message.reply(ABOUT_BOT_TEXT)
@@ -1353,6 +1743,10 @@ async def on_startup():
         BotCommand(command="menu", description="Меню режимов и настроек"),
         BotCommand(command="help", description="Список команд"),
         BotCommand(command="stats", description="Статистика чата"),
+        BotCommand(command="rates", description="Курсы валют"),
+        BotCommand(command="rate", description="Курсы валют"),
+        BotCommand(command="myrating", description="Мой рейтинг отношений"),
+        BotCommand(command="rating", description="Общий рейтинг отношений"),
         BotCommand(command="summary", description="Резюме чата за N часов"),
         BotCommand(command="analyze", description="Мафиозный анализ чата"),
         BotCommand(command="horoscope", description="Гороскоп на сегодня"),
