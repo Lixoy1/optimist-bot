@@ -89,6 +89,7 @@ MENU_AUTO_TTL_SECONDS = int(os.getenv("MENU_AUTO_TTL_SECONDS", "120"))
 SUMMARY_MAX_MESSAGES = int(os.getenv("SUMMARY_MAX_MESSAGES", "3000"))
 CONTEXT_MAX_MESSAGES = int(os.getenv("CONTEXT_MAX_MESSAGES", "25"))
 STICKERS_MAX_PER_CHAT = int(os.getenv("STICKERS_MAX_PER_CHAT", "80"))
+DEFAULT_STICKER_CHANCE = float(os.getenv("DEFAULT_STICKER_CHANCE", "0.05"))
 
 if not TG_TOKEN:
     logger.error("TG_TOKEN не найден!")
@@ -141,6 +142,7 @@ DEFAULT_CHAT_SETTINGS = {
     "horoscope_cache": {},
     "context_reactions": True,
     "stickers_enabled": True,
+    "sticker_chance": DEFAULT_STICKER_CHANCE,
     "summary_schedule_enabled": False,
     "summary_interval_hours": 6,
     "last_summary_sent_ts": 0.0,
@@ -259,12 +261,18 @@ MOODS = {
     "investor_genius": {
         "name": "💰 Гений инвестиций",
         "emoji": "📈",
-        "prompt": """Ты — тёмщик и лидер мнений в мире хайп-проектов, крипты, DeFi и рискованных инвест-историй.
-Твоя роль: разбирать маркетинг проектов, видеть признаки пирамид и скама, объяснять токеномику, реферальные механики, FOMO, KYC, листинги, памп/дамп, вайтлисты, AMA и разгоны.
-Говори живо, дерзко и с иронией: «бро», «инвестор», «тема мутная», «маркетинг жирный», «риск пахнет скамом», «DYOR».
-Давай практичные советы по проверке проекта: команда, аудит, ликвидность, vesting, дорожная карта, юридика, вывод средств, отзывы.
-Не обещай прибыль, не давай гарантии и не призывай бездумно вкладываться. Всегда подчёркивай риски и что это не финансовая рекомендация.
-Не повторяй вопрос пользователя.""",
+        "prompt": """Ты — тёмщик-аналитик, лидер хайп-проектов и жёсткий разборщик крипты, DeFi, MLM, инвестиционных клубов и финансовых пирамид.
+Твоя задача — не болтать общими словами, а раскладывать схему по косточкам: где деньги, где маркетинг, где риски, где манипуляция, где exit liquidity.
+Отвечай как опытный человек из рынка: дерзко, уверенно, с иронией, но без обещаний прибыли.
+Всегда думай в структуре:
+1) что за модель заработка;
+2) откуда берётся доход;
+3) какие красные флаги;
+4) как устроен маркетинг и FOMO;
+5) что проверить перед входом;
+6) вывод: мутная тема / можно наблюдать / риск высокий.
+Используй лексику: бро, инвестор, тема, разгон, памп, дамп, ликвидность, токеномика, вестинг, рефка, KYC, AMA, скам-риск, DYOR.
+Не повторяй вопрос пользователя. Не пиши одинаковые ответы. Не давай финансовых гарантий и не призывай вкладываться.""",
     },
     "mafioso": {
         "name": "🔪 Мафиози",
@@ -297,6 +305,14 @@ ACTIVITY_LEVELS = {
     "100": {"name": "100%", "value": 1.00},
 }
 
+STICKER_CHANCES = {
+    "0": {"name": "0%", "value": 0.00},
+    "1": {"name": "1%", "value": 0.01},
+    "3": {"name": "3%", "value": 0.03},
+    "5": {"name": "5%", "value": 0.05},
+    "10": {"name": "10%", "value": 0.10},
+}
+
 SUMMARY_INTERVALS = [1, 3, 6, 24]
 
 OPTIMISTIC_QUOTES = [
@@ -318,6 +334,15 @@ def get_activity_name(value: float) -> str:
         return ACTIVITY_LEVELS[key]["name"]
     nearest = min(ACTIVITY_LEVELS, key=lambda k: abs(int(k) - pct))
     return ACTIVITY_LEVELS[nearest]["name"]
+
+
+def get_sticker_chance_name(value: float) -> str:
+    pct = int(round(float(value) * 100))
+    key = str(pct)
+    if key in STICKER_CHANCES:
+        return STICKER_CHANCES[key]["name"]
+    nearest = min(STICKER_CHANCES, key=lambda k: abs(int(k) - pct))
+    return STICKER_CHANCES[nearest]["name"]
 
 
 def parse_hours_arg(text: str, default: int = 1) -> int:
@@ -576,13 +601,36 @@ async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperatu
 async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
     cid = str(chat_id)
     s = chat_settings[cid]
-    mood = MOODS.get(s.get("mood", "optimist"), MOODS["optimist"])
+    mood_key = s.get("mood", "optimist")
+    mood = MOODS.get(mood_key, MOODS["optimist"])
     length = RESPONSE_LENGTHS.get(s.get("response_length", "medium"), RESPONSE_LENGTHS["medium"])
     allow_prof = s.get("allow_profanity", False)
 
     recent = get_recent_messages(chat_id, limit=CONTEXT_MAX_MESSAGES)
     context = format_messages_for_llm(recent[:-1]) if recent else "Контекста пока нет."
     prof_rule = "Мат можно использовать умеренно, если он уместен." if allow_prof else "Мат, грубость и оскорбления запрещены."
+    cleaned = clean_user_text_for_llm(user_text)
+
+    if mood_key == "investor_genius":
+        investor_system = (
+            f"{mood['prompt']}\n"
+            f"{length['rule']}\n"
+            f"{prof_rule}\n"
+            f"Ты общаешься в Telegram. Начинай ответ строго с @{user_name}.\n"
+            "Запрещено повторять фразу пользователя или начинать с 'по поводу'.\n"
+            "Нужна логика, а не мотивационная вода. Каждый ответ должен быть уникальным и привязанным к сообщению.\n"
+            "Если обсуждают проект/монету/бота/заработок, разбери по схеме: модель денег → маркетинг → красные флаги → что проверить → вывод.\n"
+            "Если данных мало, прямо скажи, каких данных не хватает: сайт, токеномика, команда, условия вывода, документы, отзывы.\n"
+            "Не давай финсовет и не обещай доход. Формулируй как риск-анализ.\n\n"
+            f"Контекст последних сообщений:\n{context}"
+        )
+        # Для инвестора сначала пробуем reasoning-модель через OpenRouter, если ключ добавлен.
+        answer = await ask_openrouter_llm(investor_system, cleaned, length["max_tokens"], temperature=0.55, reasoning=True)
+        if not answer:
+            answer = await ask_llm(investor_system, cleaned, length["max_tokens"], temperature=0.65, reasoning=True)
+        if answer:
+            return answer
+        return local_fallback(user_name, mood_key)
 
     system_prompt = (
         f"{mood['prompt']}\n"
@@ -594,18 +642,16 @@ async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
         f"Контекст последних сообщений:\n{context}"
     )
 
-    cleaned = clean_user_text_for_llm(user_text)
     answer = await ask_llm(system_prompt, cleaned, length["max_tokens"], temperature=0.8)
     if answer:
         return answer
-    return local_fallback(user_name, s.get("mood", "optimist"))
-
+    return local_fallback(user_name, mood_key)
 
 def local_fallback(name: str, mood: str) -> str:
     if mood == "mafioso":
         return f"@{name}, я услышал. Спокойно, как на ночной проверке: сначала смотрим, потом голосуем. 🕴️"
     if mood == "investor_genius":
-        return f"@{name}, мысль принята. Но помни: без DYOR любой памп превращается в урок экономики. 📈"
+        return f"@{name}, бро, без цифр это пока не инвестидея, а красивая витрина. Проверяй ликвидность, вывод, команду и кто реально платит за банкет. DYOR. 📈"
     reactions = {
         "optimist": f"@{name}, я рядом. Разберёмся и вытащим из этого пользу. 🌟",
         "pessimist": f"@{name}, звучит тревожно, но катастрофу пока объявлять рано. 😕",
@@ -618,8 +664,9 @@ POSITIVE_WORDS = {"спасибо", "круто", "отлично", "супер"
 NEGATIVE_WORDS = {"плохо", "грустно", "проблема", "ужас", "беда", "больно", "страшно", "тревога", "ошибка", "провал"}
 QUESTION_WORDS = {"как", "почему", "зачем", "когда", "где", "что", "кто", "можно"}
 
+# Только популярные стандартные реакции Telegram: меньше шанс, что чат/клиент их отвергнет.
 REACTIONS = {
-    "positive": ["🔥", "👍", "❤", "👏", "😁"],
+    "positive": ["👍", "🔥", "👏", "😁", "🎉"],
     "negative": ["😢", "👎", "🤯", "😱"],
     "question": ["🤔", "👀"],
     "neutral": ["👍", "👀", "🤔"],
@@ -647,17 +694,38 @@ def detect_context_kind(text: str) -> str:
 
 async def set_context_reaction(message: types.Message, kind: Optional[str] = None) -> bool:
     kind = kind or detect_context_kind(message.text or "")
-    emoji = choice(REACTIONS.get(kind, REACTIONS["neutral"]))
-    try:
-        await bot.set_message_reaction(
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-            reaction=[ReactionTypeEmoji(emoji=emoji)],
-        )
-        return True
-    except Exception as e:
-        logger.info(f"Не удалось поставить реакцию {emoji}: {e}")
-        return False
+    # Пробуем несколько реакций: если конкретная запрещена настройками чата, fallback может пройти.
+    candidates = list(REACTIONS.get(kind, REACTIONS["neutral"])) + ["👍"]
+    tried = set()
+    for emoji in candidates:
+        if emoji in tried:
+            continue
+        tried.add(emoji)
+        try:
+            await bot.set_message_reaction(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+                is_big=False,
+            )
+            logger.info(f"Поставил реакцию {emoji} на сообщение {message.message_id}")
+            return True
+        except TypeError:
+            # Совместимость со старыми версиями aiogram без is_big.
+            try:
+                await bot.set_message_reaction(
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    reaction=[ReactionTypeEmoji(emoji=emoji)],
+                )
+                logger.info(f"Поставил реакцию {emoji} на сообщение {message.message_id}")
+                return True
+            except Exception as e:
+                last_error = e
+        except Exception as e:
+            last_error = e
+    logger.info(f"Не удалось поставить реакцию: {last_error}")
+    return False
 
 
 def remember_sticker(chat_id: int, sticker: types.Sticker):
@@ -934,9 +1002,12 @@ async def pixazo_generate_image_bytes(prompt: str, style: str = "") -> Optional[
     """Pixazo Flux/SDXL provider. Требует PIXAZO_API_KEY. Поддерживает разные форматы ответа."""
     if not PIXAZO_API_KEY:
         return None
+    negative = "low quality, blurry, deformed, bad anatomy, watermark, logo, text artifacts, extra fingers"
+    final_prompt = f"{prompt}, {style or 'high quality'}"
     payload_variants = [
-        {"prompt": f"{prompt}, {style or 'high quality'}", "steps": 25, "width": 1024, "height": 1024},
-        {"prompt": f"{prompt}, {style or 'high quality'}", "model": PIXAZO_MODEL, "width": 1024, "height": 1024},
+        {"prompt": final_prompt, "negative_prompt": negative, "steps": 28, "width": 1024, "height": 1024, "guidance_scale": 7.5},
+        {"prompt": final_prompt, "negativePrompt": negative, "model": PIXAZO_MODEL, "width": 1024, "height": 1024},
+        {"prompt": final_prompt, "model": PIXAZO_MODEL, "num_images": 1, "size": "1024x1024"},
     ]
     headers = {
         "Content-Type": "application/json",
@@ -1021,12 +1092,16 @@ async def generate_image(prompt: str, style: str = "", sticker_mode: bool = Fals
     improved_prompt = await enhance_image_prompt(prompt, style, sticker_mode)
     providers = []
     raw_providers = []
+    # Если Pixazo ключ добавлен — всегда пробуем Pixazo первым, как основной качественный генератор.
+    if PIXAZO_API_KEY:
+        raw_providers.append("pixazo")
     for chunk in [IMAGE_PROVIDER, IMAGE_FALLBACK_PROVIDER, "pollinations"]:
         raw_providers.extend([p.strip() for p in (chunk or "").split(",")])
     for provider in raw_providers:
         provider = provider.lower().strip()
         if provider and provider not in providers:
             providers.append(provider)
+    logger.info(f"Image providers order: {providers}")
 
     for provider in providers:
         if provider in {"pixazo", "pixazo-flux", "flux-schnell", "sdxl"}:
@@ -1122,6 +1197,7 @@ def settings_keyboard(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     sleep = "😴 Спит" if s.get("sleep_mode") else "✅ Бодрствует"
     reactions = "✅ Вкл" if s.get("context_reactions") else "❌ Выкл"
     stickers = "✅ Вкл" if s.get("stickers_enabled") else "❌ Выкл"
+    sticker_chance = get_sticker_chance_name(float(s.get("sticker_chance", DEFAULT_STICKER_CHANCE)))
     prof = "✅ Вкл" if s.get("allow_profanity") else "❌ Выкл"
     morning = "✅ Вкл" if s.get("morning_enabled") else "❌ Выкл"
     auto_summary = "✅ Вкл" if s.get("summary_schedule_enabled") else "❌ Выкл"
@@ -1134,7 +1210,7 @@ def settings_keyboard(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         f"🎯 Только по запросу: <b>{request_only}</b>\n"
         f"💤 Состояние: <b>{sleep}</b>\n"
         f"💬 Реакции на сообщения: <b>{reactions}</b>\n"
-        f"🎭 Стикеры из чата: <b>{stickers}</b>\n"
+        f"🎭 Стикеры из чата: <b>{stickers}</b> / шанс <b>{sticker_chance}</b>\n"
         f"🤬 Мат: <b>{prof}</b>\n"
         f"🌅 Утро: <b>{morning}</b>\n"
         f"📝 Авто-summary: <b>{auto_summary}</b> каждые {summary_int} ч"
@@ -1146,6 +1222,7 @@ def settings_keyboard(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton(text=f"💤 Сон: {sleep}", callback_data="toggle_sleep")],
         [InlineKeyboardButton(text=f"💬 Реакции: {reactions}", callback_data="toggle_reactions")],
         [InlineKeyboardButton(text=f"🎭 Стикеры: {stickers}", callback_data="toggle_stickers")],
+        [InlineKeyboardButton(text=f"🎲 Шанс стикера: {sticker_chance}", callback_data="sticker_chance_menu")],
         [InlineKeyboardButton(text=f"🤬 Мат: {prof}", callback_data="toggle_profanity")],
         [InlineKeyboardButton(text=f"🌅 Утро: {morning}", callback_data="toggle_morning")],
         [InlineKeyboardButton(text=f"📝 Авто-summary: {auto_summary}", callback_data="toggle_summary_schedule")],
@@ -1167,6 +1244,15 @@ def activity_keyboard() -> InlineKeyboardMarkup:
         rows.append(row)
     rows.append([InlineKeyboardButton(text="🔙 Настройки", callback_data="settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def sticker_chance_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="0%", callback_data="set_sticker_chance_0"), InlineKeyboardButton(text="1%", callback_data="set_sticker_chance_1")],
+        [InlineKeyboardButton(text="3%", callback_data="set_sticker_chance_3"), InlineKeyboardButton(text="5%", callback_data="set_sticker_chance_5")],
+        [InlineKeyboardButton(text="10%", callback_data="set_sticker_chance_10")],
+        [InlineKeyboardButton(text="🔙 Настройки", callback_data="settings")],
+    ])
 
 
 def summary_keyboard() -> InlineKeyboardMarkup:
@@ -1207,6 +1293,7 @@ HELP_TEXT = (
     "помолчи / тихо / молчи 15 — тишина на 15 минут\n"
     "оптимист спи / оптимист спать — полный сон до обращения\n"
     "оптимист проснись — разбудить\n\n"
+    "🎭 Стикеры: я запоминаю стикеры из чата и могу редко отправлять их по контексту; шанс настраивается в /menu.\n"
     "💡 В группе я гарантированно отвечаю на упоминание, ответ на моё сообщение или слово «оптимист»."
 )
 
@@ -1322,6 +1409,33 @@ async def toggle_stickers(call: CallbackQuery):
     save_settings()
     await show_settings(call)
 
+@router.callback_query(F.data == "sticker_chance_menu")
+async def show_sticker_chance_menu(call: CallbackQuery):
+    if not await require_admin_callback(call):
+        return
+    await call.message.edit_text(
+        "🎲 <b>Шанс отправки стикера без обращения</b>\n\n"
+        "По умолчанию 5%. Бот сначала запоминает стикеры, которые участники кидают в чат, "
+        "а потом иногда отправляет подходящий по эмоции стикер.",
+        reply_markup=sticker_chance_keyboard(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("set_sticker_chance_"))
+async def set_sticker_chance(call: CallbackQuery):
+    if not await require_admin_callback(call):
+        return
+    key = call.data.replace("set_sticker_chance_", "")
+    if key not in STICKER_CHANCES:
+        await call.answer("Неизвестный шанс", show_alert=True)
+        return
+    s = chat_settings[str(call.message.chat.id)]
+    s["sticker_chance"] = STICKER_CHANCES[key]["value"]
+    save_settings()
+    await show_settings(call)
+
+
 @router.callback_query(F.data == "toggle_profanity")
 async def toggle_profanity(call: CallbackQuery):
     if not await require_admin_callback(call):
@@ -1432,7 +1546,8 @@ async def cmd_stats(message: types.Message):
         f"Сегодня: <b>{stats.get('daily_messages', {}).get(today, 0)}</b>\n"
         f"Активность без обращения: <b>{activity}</b>\n"
         f"Сохранено сообщений для summary: <b>{len(stats.get('messages', []))}</b>\n"
-        f"Стикеров запомнено: <b>{len(chat_stickers[cid])}</b>"
+        f"Стикеров запомнено: <b>{len(chat_stickers[cid])}</b>\n"
+        f"Шанс стикера: <b>{get_sticker_chance_name(float(chat_settings[cid].get("sticker_chance", DEFAULT_STICKER_CHANCE)))}</b>"
     )
     await message.reply(text)
 
@@ -1649,13 +1764,28 @@ async def generate_horoscope(chat_id: int, user_name: str, sign: Optional[str] =
     if cache.get("date") == today and cache.get(cache_key):
         return cache[cache_key]
 
-    mood = MOODS.get(chat_settings[cid].get("mood", "optimist"), MOODS["optimist"])["name"]
     target = f"для знака {sign}" if sign else f"для {user_name}"
-    prompt = f"Напиши короткий позитивный гороскоп на сегодня {target}. Тон: {mood}. 5-7 предложений с эмодзи."
-    system = "Ты астролог-оптимист. Отвечай сразу, без вступления и без дисклеймеров."
-    text = await ask_llm(system, prompt, max_tokens=300, temperature=0.9)
+    weekday = datetime.date.today().strftime("%A")
+    system = (
+        "Ты — эпический астролог-оптимист для Telegram. "
+        "Пиши не скучный гороскоп, а заряд энергии: кинематографично, ярко, уверенно, с юмором. "
+        "Структура: 1) короткий заголовок, 2) энергия дня, 3) деньги/дела, 4) общение/отношения, 5) один конкретный совет, 6) мощная финальная фраза. "
+        "Не используй мрачные предсказания и не повторяйся. Без дисклеймеров."
+    )
+    prompt = (
+        f"Сделай гороскоп на сегодня ({today}, {weekday}) {target}. "
+        "Стиль: эпик-оптимизм, уверенность, огонь, но без воды. 6-9 предложений, эмодзи уместно."
+    )
+    text = await ask_llm(system, prompt, max_tokens=420, temperature=0.95)
     if not text:
-        text = f"@{user_name}, сегодня звёзды говорят: удача любит тех, кто делает первый шаг. 🌟"
+        text = (
+            f"⚡ <b>День большого хода</b>\n"
+            f"@{user_name}, сегодня вселенная будто подмигивает: не стой у двери, заходи красиво. "
+            "В делах включай скорость, но не суету — один точный шаг даст больше, чем десять нервных. "
+            "В общении держи лёгкость: нужные люди услышат тебя с первого раза. "
+            "Совет дня: выбери одну важную цель и добей её до вечера. "
+            "Финал простой: сегодня не день ждать знак — сегодня ты сам знак. 🌟"
+        )
 
     if "horoscope_cache" not in chat_settings[cid] or not isinstance(chat_settings[cid]["horoscope_cache"], dict):
         chat_settings[cid]["horoscope_cache"] = {}
@@ -1716,7 +1846,7 @@ async def cmd_draw(message: types.Message):
         except Exception as e:
             logger.error(f"Ошибка отправки Pollinations image: {e}")
 
-    await message.reply("😔 Не получилось сгенерировать изображение. Попробуй другой запрос или проверь GEMINI_API_KEY.")
+    await message.reply("😔 Не получилось сгенерировать изображение. Попробуй другой запрос или проверь PIXAZO_API_KEY / HF_TOKEN, fallback уйдёт на Pollinations/Horde.")
 
 # ==================== СТИКЕРЫ ====================
 @router.message(F.sticker)
@@ -1834,20 +1964,26 @@ async def main_handler(message: types.Message):
         if s.get("request_only", False):
             return
 
-        # Один roll на всё поведение. 10% = максимум 10% любых реакций/стикеров/ответов без обращения.
-        if random() >= float(s.get("activity_level", 0.1)):
-            return
-
         kind = detect_context_kind(text)
-        action_roll = random()
-        if s.get("context_reactions", True) and action_roll < 0.65:
-            await set_context_reaction(message, kind)
-            return
-        if s.get("stickers_enabled", True) and action_roll < 0.85:
+        activity = max(0.0, min(1.0, float(s.get("activity_level", 0.1))))
+        sticker_chance = max(0.0, min(0.25, float(s.get("sticker_chance", DEFAULT_STICKER_CHANCE))))
+
+        # 1) Стикер — отдельная редкая логика. По умолчанию 5%, если стикеры в чате уже запомнены.
+        if s.get("stickers_enabled", True) and random() < sticker_chance:
             sent = await send_context_sticker(message, kind)
             if sent:
                 return
-        # Редкий короткий ответ только в рамках общей интенсивности.
+
+        # 2) Реакция — не текстовый ответ, поэтому можно чаще, но строго в рамках активности.
+        if s.get("context_reactions", True) and random() < activity:
+            reacted = await set_context_reaction(message, kind)
+            if reacted:
+                return
+
+        # 3) Самовольный текстовый ответ — самый редкий, чтобы бот не флудил.
+        text_answer_chance = min(0.12, activity * 0.25)
+        if random() >= text_answer_chance:
+            return
 
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
     response = await get_llm_response(text, chat_id, user_name)
