@@ -3,8 +3,8 @@
 Оптимист complete final — Telegram AI bot.
 
 Функции:
-- Groq + Gemini fallback для ответов.
-- Pollinations FLUX / AI Horde SD / Gemini для генерации изображений с авто-fallback и скрытым улучшением промпта.
+- Groq + Gemini + OpenRouter + GitHub Models fallback для ответов.
+- Pixazo / Hugging Face / Pollinations FLUX / AI Horde SD / Gemini для генерации изображений с авто-fallback и скрытым улучшением промпта.
 - Настройки через inline меню, менять могут только админы групп.
 - Режим «только по запросу» и режим сна «Оптимист спи/спать».
 - Точная интенсивность активности: 0%, 10%, 20% ... 100%.
@@ -55,16 +55,33 @@ load_dotenv()
 TG_TOKEN = os.getenv("TG_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GITHUB_MODELS_TOKEN = os.getenv("GITHUB_MODELS_TOKEN") or os.getenv("GITHUB_TOKEN")
+
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "pollinations").lower().strip()
-IMAGE_FALLBACK_PROVIDER = os.getenv("IMAGE_FALLBACK_PROVIDER", "horde,pollinations").lower().strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-r1:free")
+OPENROUTER_REASONING_MODEL = os.getenv("OPENROUTER_REASONING_MODEL", "deepseek/deepseek-r1:free")
+GITHUB_MODELS_ENDPOINT = os.getenv("GITHUB_MODELS_ENDPOINT", "https://models.github.ai/inference/chat/completions")
+GITHUB_MODELS_MODEL = os.getenv("GITHUB_MODELS_MODEL", "openai/gpt-4o-mini")
+GITHUB_REASONING_MODEL = os.getenv("GITHUB_REASONING_MODEL", "deepseek/DeepSeek-R1-0528")
+
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "pixazo,pollinations").lower().strip()
+IMAGE_FALLBACK_PROVIDER = os.getenv("IMAGE_FALLBACK_PROVIDER", "huggingface,horde,pollinations").lower().strip()
 POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux").lower().strip()
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 AI_HORDE_API_KEY = os.getenv("AI_HORDE_API_KEY", "0000000000")
 AI_HORDE_MODEL = os.getenv("AI_HORDE_MODEL", "stable_diffusion_xl")
 AI_HORDE_TIMEOUT_SECONDS = int(os.getenv("AI_HORDE_TIMEOUT_SECONDS", "120"))
+PIXAZO_API_KEY = os.getenv("PIXAZO_API_KEY")
+PIXAZO_ENDPOINT = os.getenv("PIXAZO_ENDPOINT", "https://gateway.pixazo.ai/flux-2-klein-4b/v1/generateImage")
+PIXAZO_MODEL = os.getenv("PIXAZO_MODEL", "flux-schnell")
+PIXAZO_TIMEOUT_SECONDS = int(os.getenv("PIXAZO_TIMEOUT_SECONDS", "90"))
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_KEY")
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
+HF_IMAGE_PROVIDER = os.getenv("HF_IMAGE_PROVIDER", "hf-inference")
+HF_IMAGE_ENDPOINT = os.getenv("HF_IMAGE_ENDPOINT", "https://router.huggingface.co/hf-inference/models/{model}")
 MORNING_TZ = os.getenv("MORNING_TZ", "Europe/Moscow")
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "8"))
 MENU_DELETE_SECONDS = int(os.getenv("MENU_DELETE_SECONDS", "2"))
@@ -395,8 +412,105 @@ async def temporary_menu(message: types.Message, text: str, reply_markup: Inline
     return sent
 
 # ==================== LLM ====================
-async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperature: float = 0.8) -> Optional[str]:
-    """Сначала Groq, затем быстрый Groq, затем Gemini."""
+async def _extract_openai_chat_content(data: Dict[str, Any]) -> Optional[str]:
+    try:
+        choices = data.get("choices") or []
+        if not choices:
+            return None
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    txt = item.get("text") or item.get("content")
+                    if txt:
+                        parts.append(str(txt))
+            if parts:
+                return "\n".join(parts).strip()
+    except Exception:
+        pass
+    return None
+
+
+async def ask_openrouter_llm(system_prompt: str, user_text: str, max_tokens: int, temperature: float = 0.8, reasoning: bool = False) -> Optional[str]:
+    """OpenRouter fallback. Хорош для reasoning-задач, включая DeepSeek R1."""
+    if not OPENROUTER_API_KEY:
+        return None
+    model = OPENROUTER_REASONING_MODEL if reasoning else OPENROUTER_MODEL
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://t.me/Optimist2_Bot"),
+                    "X-Title": os.getenv("OPENROUTER_APP_NAME", "Optimist Telegram Bot"),
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_text},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as resp:
+                raw = await resp.text()
+                if resp.status == 200:
+                    content = await _extract_openai_chat_content(json.loads(raw))
+                    if content:
+                        return content
+                logger.warning(f"OpenRouter {model} вернул {resp.status}: {raw[:300]}")
+    except Exception as e:
+        logger.warning(f"OpenRouter ошибка: {e}")
+    return None
+
+
+async def ask_github_models_llm(system_prompt: str, user_text: str, max_tokens: int, temperature: float = 0.8, reasoning: bool = False) -> Optional[str]:
+    """GitHub Models fallback. Нужен PAT с models:read."""
+    if not GITHUB_MODELS_TOKEN:
+        return None
+    model = GITHUB_REASONING_MODEL if reasoning else GITHUB_MODELS_MODEL
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                GITHUB_MODELS_ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {GITHUB_MODELS_TOKEN}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2026-03-10",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_text},
+                    ],
+                    "temperature": max(0, min(1, temperature)),
+                    "max_tokens": max_tokens,
+                },
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as resp:
+                raw = await resp.text()
+                if resp.status == 200:
+                    content = await _extract_openai_chat_content(json.loads(raw))
+                    if content:
+                        return content
+                logger.warning(f"GitHub Models {model} вернул {resp.status}: {raw[:300]}")
+    except Exception as e:
+        logger.warning(f"GitHub Models ошибка: {e}")
+    return None
+
+
+async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperature: float = 0.8, reasoning: bool = False) -> Optional[str]:
+    """Groq → Gemini → OpenRouter → GitHub Models. Для сложной логики можно reasoning=True."""
     if GROQ_API_KEY:
         for model in [GROQ_MODEL, GROQ_FAST_MODEL]:
             try:
@@ -415,11 +529,12 @@ async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperatu
                         },
                         timeout=aiohttp.ClientTimeout(total=30),
                     ) as resp:
+                        raw = await resp.text()
                         if resp.status == 200:
-                            data = await resp.json()
-                            return data["choices"][0]["message"]["content"].strip()
-                        err = await resp.text()
-                        logger.warning(f"Groq {model} вернул {resp.status}: {err[:300]}")
+                            content = await _extract_openai_chat_content(json.loads(raw))
+                            if content:
+                                return content
+                        logger.warning(f"Groq {model} вернул {resp.status}: {raw[:300]}")
             except Exception as e:
                 logger.warning(f"Groq {model} ошибка: {e}")
 
@@ -434,20 +549,29 @@ async def ask_llm(system_prompt: str, user_text: str, max_tokens: int, temperatu
             }
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                    raw = await resp.text()
                     if resp.status == 200:
-                        data = await resp.json()
+                        data = json.loads(raw)
                         candidates = data.get("candidates") or []
                         if candidates:
                             parts = candidates[0].get("content", {}).get("parts", [])
                             if parts and "text" in parts[0]:
                                 return parts[0]["text"].strip()
-                    err = await resp.text()
-                    logger.warning(f"Gemini вернул {resp.status}: {err[:300]}")
+                    logger.warning(f"Gemini вернул {resp.status}: {raw[:300]}")
         except Exception as e:
             logger.warning(f"Gemini ошибка: {e}")
 
-    return None
+    # Резерв 1: OpenRouter. Для /analyze можно включить reasoning=True, чтобы взять DeepSeek R1.
+    answer = await ask_openrouter_llm(system_prompt, user_text, max_tokens, temperature, reasoning=reasoning)
+    if answer:
+        return answer
 
+    # Резерв 2: GitHub Models. Бесплатно/лимитировано, требует GitHub token models:read.
+    answer = await ask_github_models_llm(system_prompt, user_text, max_tokens, temperature, reasoning=reasoning)
+    if answer:
+        return answer
+
+    return None
 
 async def get_llm_response(user_text: str, chat_id: int, user_name: str) -> str:
     cid = str(chat_id)
@@ -756,6 +880,142 @@ async def ai_horde_generate_image_bytes(prompt: str, style: str = "") -> Optiona
     return None
 
 
+
+def find_first_url(obj: Any) -> Optional[str]:
+    """Ищет первый http(s)-URL в JSON-ответе провайдера картинок."""
+    if isinstance(obj, str):
+        if obj.startswith("http://") or obj.startswith("https://"):
+            return obj
+        return None
+    if isinstance(obj, list):
+        for item in obj:
+            found = find_first_url(item)
+            if found:
+                return found
+    if isinstance(obj, dict):
+        for key in ["url", "image_url", "output_url", "result_url", "download_url", "image", "file", "src"]:
+            if key in obj:
+                found = find_first_url(obj[key])
+                if found:
+                    return found
+        for value in obj.values():
+            found = find_first_url(value)
+            if found:
+                return found
+    return None
+
+
+def find_first_base64(obj: Any) -> Optional[str]:
+    """Ищет base64-картинку в JSON-ответе провайдера картинок."""
+    if isinstance(obj, str):
+        if obj.startswith("data:image/") or (len(obj) > 300 and re.fullmatch(r"[A-Za-z0-9+/=\n\r]+", obj.strip())):
+            return obj.strip()
+        return None
+    if isinstance(obj, list):
+        for item in obj:
+            found = find_first_base64(item)
+            if found:
+                return found
+    if isinstance(obj, dict):
+        for key in ["base64", "b64", "image_base64", "imageData", "image_data", "data"]:
+            if key in obj:
+                found = find_first_base64(obj[key])
+                if found:
+                    return found
+        for value in obj.values():
+            found = find_first_base64(value)
+            if found:
+                return found
+    return None
+
+
+
+async def pixazo_generate_image_bytes(prompt: str, style: str = "") -> Optional[bytes]:
+    """Pixazo Flux/SDXL provider. Требует PIXAZO_API_KEY. Поддерживает разные форматы ответа."""
+    if not PIXAZO_API_KEY:
+        return None
+    payload_variants = [
+        {"prompt": f"{prompt}, {style or 'high quality'}", "steps": 25, "width": 1024, "height": 1024},
+        {"prompt": f"{prompt}, {style or 'high quality'}", "model": PIXAZO_MODEL, "width": 1024, "height": 1024},
+    ]
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Ocp-Apim-Subscription-Key": PIXAZO_API_KEY,
+        "Authorization": f"Bearer {PIXAZO_API_KEY}",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            for payload in payload_variants:
+                async with session.post(PIXAZO_ENDPOINT, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=PIXAZO_TIMEOUT_SECONDS)) as resp:
+                    raw_bytes = await resp.read()
+                    content_type = (resp.headers.get("Content-Type") or "").lower()
+                    if resp.status != 200:
+                        logger.warning(f"Pixazo image status {resp.status}: {raw_bytes[:300]!r}")
+                        continue
+                    if content_type.startswith("image/"):
+                        return raw_bytes
+                    try:
+                        data = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        continue
+                    url = find_first_url(data)
+                    if url:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as img_resp:
+                            if img_resp.status == 200:
+                                return await img_resp.read()
+                    b64 = find_first_base64(data)
+                    if b64:
+                        return base64.b64decode(b64.split(",")[-1])
+    except Exception as e:
+        logger.warning(f"Pixazo image error: {e}")
+    return None
+
+
+async def huggingface_generate_image_bytes(prompt: str, style: str = "") -> Optional[bytes]:
+    """Hugging Face Inference Providers text-to-image. Требует HF_TOKEN."""
+    if not HF_TOKEN:
+        return None
+    endpoint = HF_IMAGE_ENDPOINT.format(model=urllib.parse.quote(HF_IMAGE_MODEL, safe=""))
+    payload = {
+        "inputs": f"{prompt}, {style or 'high quality, detailed'}",
+        "parameters": {
+            "width": 1024,
+            "height": 1024,
+            "num_inference_steps": 4 if "schnell" in HF_IMAGE_MODEL.lower() else 25,
+            "guidance_scale": 0.0 if "schnell" in HF_IMAGE_MODEL.lower() else 7.0,
+            "negative_prompt": "watermark, logo, blurry, low quality, distorted, extra fingers, bad anatomy",
+        },
+        "options": {"wait_for_model": True},
+    }
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "image/png",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                raw = await resp.read()
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                if resp.status == 200 and content_type.startswith("image/"):
+                    return raw
+                if resp.status == 200:
+                    try:
+                        data = json.loads(raw.decode("utf-8", errors="ignore"))
+                        url = find_first_url(data)
+                        if url:
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as img_resp:
+                                if img_resp.status == 200:
+                                    return await img_resp.read()
+                    except Exception:
+                        pass
+                logger.warning(f"HF image {HF_IMAGE_MODEL} status {resp.status}: {raw[:300]!r}")
+    except Exception as e:
+        logger.warning(f"HF image error: {e}")
+    return None
+
+
 async def generate_image(prompt: str, style: str = "", sticker_mode: bool = False) -> Tuple[Optional[bytes], Optional[str], str]:
     """Единая точка генерации. Возвращает (bytes, url, provider_name)."""
     improved_prompt = await enhance_image_prompt(prompt, style, sticker_mode)
@@ -769,7 +1029,15 @@ async def generate_image(prompt: str, style: str = "", sticker_mode: bool = Fals
             providers.append(provider)
 
     for provider in providers:
-        if provider in {"pollinations", "pollination", "flux", "sd", "stable-diffusion"}:
+        if provider in {"pixazo", "pixazo-flux", "flux-schnell", "sdxl"}:
+            image_bytes = await pixazo_generate_image_bytes(improved_prompt, style)
+            if image_bytes:
+                return image_bytes, None, f"Pixazo/{PIXAZO_MODEL}"
+        elif provider in {"huggingface", "hf", "hf-inference", "hf_flux"}:
+            image_bytes = await huggingface_generate_image_bytes(improved_prompt, style)
+            if image_bytes:
+                return image_bytes, None, f"HuggingFace/{HF_IMAGE_MODEL}"
+        elif provider in {"pollinations", "pollination", "flux", "sd", "stable-diffusion"}:
             try:
                 url = await pollinations_image_url(improved_prompt, style or "high quality, detailed")
                 return None, url, f"Pollinations/{POLLINATIONS_IMAGE_MODEL}"
@@ -1361,7 +1629,7 @@ async def cmd_analyze(message: types.Message):
         "Дай вердикт: 'Чисто' или 'Пахнет мафией'. Пиши в стиле ведущего Мафии, с юмором, но без реальных обвинений."
     )
     prompt = f"Последние сообщения чата:\n{context}\n\nСделай мафиозный анализ как ведущий игры."
-    analysis = await ask_llm(system, prompt, max_tokens=650, temperature=0.7)
+    analysis = await ask_llm(system, prompt, max_tokens=650, temperature=0.7, reasoning=True)
     if not analysis:
         analysis = "Стол молчит, ночь темна. Но я бы проверил самого спокойного — слишком уж чисто выглядит. 🕴️"
     await message.reply(f"🔪 <b>Мафиозный анализ</b>\n\n{html_escape(analysis)}")
