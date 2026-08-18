@@ -1,4 +1,4 @@
 result=NO_TOKEN
-detail=GitHub secret RAILWAY_TOKEN is not configured
-source_sha=ffa7dfebb5c30b1ed900076a04f3801e50427aad
-utc=2026-08-18T15:15:04Z
+detail=Neither RAILWAY_TOKEN nor RAILWAY_API_TOKEN is configured in GitHub Secrets
+source_sha=e4662c5a65b9311d4c5d1ca718816bb9aefaf82a
+utc=2026-08-18T15:17:06Z
