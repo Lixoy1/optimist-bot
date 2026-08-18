@@ -74,10 +74,13 @@ def _fake_chat_app(mood_key):
         chat_settings=settings,
         MOODS=moods,
         RESPONSE_LENGTHS={"medium": {"rule": "MEDIUM-RULE", "max_tokens": 500}},
+        # Production stores the current message before building context, so the
+        # last item is intentionally excluded by smart_get_llm_response().
         get_recent_messages=lambda chat_id, limit=40: [
             {"user": "Лена", "text": "Мне нравится этот вариант", "reply_to_user": ""},
             {"user": "Алекс", "text": "Почему?", "reply_to_user": "Лена"},
             {"user": "Лена", "text": "Потому что он логичнее", "reply_to_user": "Алекс"},
+            {"user": "Алекс", "text": "А если теперь?", "reply_to_user": "Лена"},
         ],
         clean_user_text_for_llm=lambda text: text,
         ask_llm=ask_llm,
