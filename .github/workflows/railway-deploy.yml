@@ -19,7 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SECRET_RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SECRET_RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PROJECT_ID: df8e411e-b627-44f4-ba5a-d0683169878b
       SERVICE_ID: a99d6791-d40c-4fc2-94ea-5582af2de0c8
       ENVIRONMENT_ID: 1d28a49c-3e1e-4d14-bf18-1228e8eb638d
@@ -41,17 +42,27 @@ jobs:
           set +e
           RESULT="UNKNOWN"
           DETAIL=""
+          AUTH_KIND="none"
 
-          if [ -z "${RAILWAY_TOKEN}" ]; then
+          unset RAILWAY_TOKEN RAILWAY_API_TOKEN
+          if [ -n "${SECRET_RAILWAY_TOKEN}" ]; then
+            export RAILWAY_TOKEN="${SECRET_RAILWAY_TOKEN}"
+            AUTH_KIND="project-token"
+          elif [ -n "${SECRET_RAILWAY_API_TOKEN}" ]; then
+            export RAILWAY_API_TOKEN="${SECRET_RAILWAY_API_TOKEN}"
+            AUTH_KIND="account-or-workspace-token"
+          fi
+
+          if [ "${AUTH_KIND}" = "none" ]; then
             RESULT="NO_TOKEN"
-            DETAIL="GitHub secret RAILWAY_TOKEN is not configured"
+            DETAIL="Neither RAILWAY_TOKEN nor RAILWAY_API_TOKEN is configured in GitHub Secrets"
             RC=2
           else
             npm install --global @railway/cli > /tmp/railway-install.log 2>&1
             INSTALL_RC=$?
             if [ ${INSTALL_RC} -ne 0 ]; then
               RESULT="CLI_INSTALL_FAILED"
-              DETAIL="Railway CLI installation failed"
+              DETAIL="Railway CLI installation failed; auth=${AUTH_KIND}"
               RC=${INSTALL_RC}
             else
               railway up \
@@ -63,10 +74,10 @@ jobs:
               RC=$?
               if [ ${RC} -eq 0 ]; then
                 RESULT="SUCCESS"
-                DETAIL="railway up reached successful terminal status"
+                DETAIL="railway up reached successful terminal status; auth=${AUTH_KIND}"
               else
                 RESULT="FAILED"
-                DETAIL="railway up returned exit code ${RC}"
+                DETAIL="railway up returned exit code ${RC}; auth=${AUTH_KIND}"
               fi
             fi
           fi
