@@ -9,6 +9,7 @@ os.environ.setdefault("MORNING_TZ", "Europe/Moscow")
 import optimist_bot_complete_final as app
 import optimist_entrypoint as entry
 import optimist_features as features
+import optimist_hotfixes as hotfixes
 
 
 def test_entrypoint_uses_persistent_data_dir():
@@ -77,6 +78,38 @@ def test_social_graph_uses_real_reply_edges(monkeypatch):
     assert "Алекс" in text
     assert "Лена" in text
     assert "reply" in text
+
+
+def test_pixazo_payload_matches_current_flux_klein_contract():
+    payload = hotfixes._pixazo_payload("test prompt")
+    assert payload == {
+        "prompt": "test prompt",
+        "steps": 25,
+        "width": 1024,
+        "height": 1024,
+    }
+    assert "negative_prompt" not in payload
+    assert "guidance_scale" not in payload
+
+
+def test_pollinations_uses_current_gen_endpoint():
+    url = hotfixes._pollinations_url("cat in space")
+    assert url.startswith("https://gen.pollinations.ai/image/")
+    assert "model=flux" in url
+    assert "width=1024" in url
+    assert "height=1024" in url
+
+
+def test_smart_context_keeps_reply_relationships():
+    context = hotfixes.build_smart_context(_sample_messages())
+    assert "Лена → Алекс: Как дела?" in context
+    assert "Алекс → Лена: Супер, а у тебя?" in context
+    assert "Никита → Алекс: Что обсуждаем?" in context
+
+
+def test_hotfix_is_installed_on_runtime_module():
+    assert app.get_llm_response.__module__ == "optimist_hotfixes"
+    assert app.generate_image.__module__ == "optimist_hotfixes"
 
 
 def test_railway_config_present_and_points_to_entrypoint():
