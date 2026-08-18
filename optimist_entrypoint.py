@@ -5,7 +5,8 @@ Keeps the original bot file untouched while adding:
 - persistent JSON storage through DATA_DIR (Railway Volume-friendly),
 - /status diagnostics,
 - /missed [hours] rich catch-up summary,
-- extension router registered before the original catch-all handler.
+- weekly awards, social graph and crypto alerts,
+- extension routers registered before the original catch-all handler.
 """
 
 import asyncio
@@ -21,6 +22,7 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand
 
 import optimist_bot_complete_final as app
+import optimist_features as features
 
 
 BOOT_TS = time.time()
@@ -136,7 +138,6 @@ async def cmd_missed(message: types.Message):
         await message.reply(_fallback_missed(messages, hours))
         return
 
-    # Keep the prompt compact enough for all configured LLM fallbacks.
     selected = messages[-160:]
     transcript_lines = []
     for item in selected:
@@ -187,19 +188,26 @@ async def production_startup():
     current = await app.bot.get_my_commands()
     existing = {cmd.command for cmd in current}
     additions = []
-    if "status" not in existing:
-        additions.append(BotCommand(command="status", description="Состояние и uptime бота"))
-    if "missed" not in existing:
-        additions.append(BotCommand(command="missed", description="Что пропустил за N часов"))
+    local_commands = [
+        BotCommand(command="status", description="Состояние и uptime бота"),
+        BotCommand(command="missed", description="Что пропустил за N часов"),
+        *features.FEATURE_COMMANDS,
+    ]
+    for command in local_commands:
+        if command.command not in existing:
+            additions.append(command)
+            existing.add(command.command)
     if additions:
         await app.bot.set_my_commands([*current, *additions])
+    features.start_feature_tasks()
     app.logger.info("💾 Persistent storage: %s", app.SETTINGS_FILE)
 
 
 async def main():
-    # Register extension handlers before the original router because the original
-    # module ends with a catch-all message handler.
+    # All extension handlers must be registered before the original router,
+    # because the original module ends with a catch-all message handler.
     app.dp.include_router(extension_router)
+    app.dp.include_router(features.feature_router)
     app.dp.include_router(app.router)
     await production_startup()
     threading.Thread(target=app.start_http_server, daemon=True).start()
