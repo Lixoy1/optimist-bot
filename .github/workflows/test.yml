@@ -35,6 +35,7 @@ jobs:
           python -m py_compile optimist_bot_complete_final.py
           test ! -f optimist_entrypoint.py || python -m py_compile optimist_entrypoint.py
           test ! -f optimist_features.py || python -m py_compile optimist_features.py
+          test ! -f optimist_hotfixes.py || python -m py_compile optimist_hotfixes.py
 
       - name: Run unit tests
         env:
