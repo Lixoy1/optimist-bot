@@ -17,24 +17,17 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       SECRET_RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
       SECRET_RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       SECRET_RAILWAY_PROJECT_TOKEN: ${{ secrets.RAILWAY_PROJECT_TOKEN }}
       SECRET_RAILWAY_ACCESS_TOKEN: ${{ secrets.RAILWAY_ACCESS_TOKEN }}
-      SECRET_RAILWAY_API_KEY: ${{ secrets.RAILWAY_API_KEY }}
-      SECRET_RAILWAY_KEY: ${{ secrets.RAILWAY_KEY }}
-      SECRET_RAILWAY_AUTH_TOKEN: ${{ secrets.RAILWAY_AUTH_TOKEN }}
-      SECRET_RAILWAY_CLI_TOKEN: ${{ secrets.RAILWAY_CLI_TOKEN }}
-      SECRET_RAILWAY: ${{ secrets.RAILWAY }}
       VAR_RAILWAY_TOKEN: ${{ vars.RAILWAY_TOKEN }}
       VAR_RAILWAY_API_TOKEN: ${{ vars.RAILWAY_API_TOKEN }}
-      VAR_RAILWAY_PROJECT_TOKEN: ${{ vars.RAILWAY_PROJECT_TOKEN }}
-      VAR_RAILWAY_ACCESS_TOKEN: ${{ vars.RAILWAY_ACCESS_TOKEN }}
-      PROJECT_ID: df8e411e-b627-44f4-ba5a-d0683169878b
-      SERVICE_ID: a99d6791-d40c-4fc2-94ea-5582af2de0c8
-      ENVIRONMENT_ID: 1d28a49c-3e1e-4d14-bf18-1228e8eb638d
+      PROJECT_ID: c4b740e5-149f-461d-a5cc-c58cb3881344
+      ENVIRONMENT_NAME: production
+      SERVICE_NAME: OptimistBot
     steps:
       - name: Checkout current main
         uses: actions/checkout@v4
@@ -46,107 +39,88 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Run direct Railway deploy
-        id: railway
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Configure Railway authentication
+        id: auth
+        shell: bash
+        run: |
+          set -e
+          if [ -n "${SECRET_RAILWAY_TOKEN}" ]; then
+            echo "RAILWAY_TOKEN=${SECRET_RAILWAY_TOKEN}" >> "$GITHUB_ENV"
+            echo "mode=project-token" >> "$GITHUB_OUTPUT"
+          elif [ -n "${SECRET_RAILWAY_PROJECT_TOKEN}" ]; then
+            echo "RAILWAY_TOKEN=${SECRET_RAILWAY_PROJECT_TOKEN}" >> "$GITHUB_ENV"
+            echo "mode=project-token" >> "$GITHUB_OUTPUT"
+          elif [ -n "${VAR_RAILWAY_TOKEN}" ]; then
+            echo "RAILWAY_TOKEN=${VAR_RAILWAY_TOKEN}" >> "$GITHUB_ENV"
+            echo "mode=project-token" >> "$GITHUB_OUTPUT"
+          elif [ -n "${SECRET_RAILWAY_API_TOKEN}" ]; then
+            echo "RAILWAY_API_TOKEN=${SECRET_RAILWAY_API_TOKEN}" >> "$GITHUB_ENV"
+            echo "mode=api-token" >> "$GITHUB_OUTPUT"
+          elif [ -n "${SECRET_RAILWAY_ACCESS_TOKEN}" ]; then
+            echo "RAILWAY_API_TOKEN=${SECRET_RAILWAY_ACCESS_TOKEN}" >> "$GITHUB_ENV"
+            echo "mode=api-token" >> "$GITHUB_OUTPUT"
+          elif [ -n "${VAR_RAILWAY_API_TOKEN}" ]; then
+            echo "RAILWAY_API_TOKEN=${VAR_RAILWAY_API_TOKEN}" >> "$GITHUB_ENV"
+            echo "mode=api-token" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=browserless" >> "$GITHUB_OUTPUT"
+            echo "No Railway token found; starting browserless device login."
+            railway login --browserless
+          fi
+
+      - name: Link real Railway project
+        run: |
+          railway link \
+            --project "${PROJECT_ID}" \
+            --environment "${ENVIRONMENT_NAME}" \
+            --service "${SERVICE_NAME}"
+
+      - name: Show target status before deploy
+        run: railway status
+
+      - name: Deploy Legacy Brain v3
+        id: deploy
         shell: bash
         run: |
           set +e
-          RESULT="UNKNOWN"
-          DETAIL=""
-          AUTH_KIND="none"
-          TOKEN_VALUE=""
-          TOKEN_MODE=""
-
-          pick_token() {
-            local value="$1"
-            local kind="$2"
-            local mode="$3"
-            if [ -z "${TOKEN_VALUE}" ] && [ -n "${value}" ]; then
-              TOKEN_VALUE="${value}"
-              AUTH_KIND="${kind}"
-              TOKEN_MODE="${mode}"
-            fi
-          }
-
-          pick_token "${SECRET_RAILWAY_TOKEN}" "secret:RAILWAY_TOKEN" "project"
-          pick_token "${SECRET_RAILWAY_API_TOKEN}" "secret:RAILWAY_API_TOKEN" "api"
-          pick_token "${SECRET_RAILWAY_PROJECT_TOKEN}" "secret:RAILWAY_PROJECT_TOKEN" "project"
-          pick_token "${SECRET_RAILWAY_ACCESS_TOKEN}" "secret:RAILWAY_ACCESS_TOKEN" "api"
-          pick_token "${SECRET_RAILWAY_API_KEY}" "secret:RAILWAY_API_KEY" "api"
-          pick_token "${SECRET_RAILWAY_KEY}" "secret:RAILWAY_KEY" "api"
-          pick_token "${SECRET_RAILWAY_AUTH_TOKEN}" "secret:RAILWAY_AUTH_TOKEN" "api"
-          pick_token "${SECRET_RAILWAY_CLI_TOKEN}" "secret:RAILWAY_CLI_TOKEN" "api"
-          pick_token "${SECRET_RAILWAY}" "secret:RAILWAY" "api"
-          pick_token "${VAR_RAILWAY_TOKEN}" "var:RAILWAY_TOKEN" "project"
-          pick_token "${VAR_RAILWAY_API_TOKEN}" "var:RAILWAY_API_TOKEN" "api"
-          pick_token "${VAR_RAILWAY_PROJECT_TOKEN}" "var:RAILWAY_PROJECT_TOKEN" "project"
-          pick_token "${VAR_RAILWAY_ACCESS_TOKEN}" "var:RAILWAY_ACCESS_TOKEN" "api"
-
-          unset RAILWAY_TOKEN RAILWAY_API_TOKEN
-          if [ "${TOKEN_MODE}" = "project" ]; then
-            export RAILWAY_TOKEN="${TOKEN_VALUE}"
-          elif [ "${TOKEN_MODE}" = "api" ]; then
-            export RAILWAY_API_TOKEN="${TOKEN_VALUE}"
-          fi
-
-          if [ "${AUTH_KIND}" = "none" ]; then
-            RESULT="NO_TOKEN"
-            DETAIL="No Railway credential found in tested GitHub Secrets/Variables names"
-            RC=2
+          railway up \
+            --project "${PROJECT_ID}" \
+            --environment "${ENVIRONMENT_NAME}" \
+            --service "${SERVICE_NAME}" \
+            --message "Legacy Brain v3 ${GITHUB_SHA}" \
+            --ci \
+            > /tmp/railway-deploy.log 2>&1
+          RC=$?
+          cat /tmp/railway-deploy.log
+          if [ ${RC} -eq 0 ]; then
+            echo "result=SUCCESS" >> "$GITHUB_OUTPUT"
           else
-            npm install --global @railway/cli > /tmp/railway-install.log 2>&1
-            INSTALL_RC=$?
-            if [ ${INSTALL_RC} -ne 0 ]; then
-              RESULT="CLI_INSTALL_FAILED"
-              DETAIL="Railway CLI installation failed; auth=${AUTH_KIND}"
-              RC=${INSTALL_RC}
-            else
-              railway up \
-                --project "${PROJECT_ID}" \
-                --environment "${ENVIRONMENT_ID}" \
-                --service "${SERVICE_ID}" \
-                --message "Legacy Brain v3 ${GITHUB_SHA}" \
-                > /tmp/railway-deploy.log 2>&1
-              RC=$?
-              if [ ${RC} -eq 0 ]; then
-                RESULT="SUCCESS"
-                DETAIL="railway up reached successful terminal status; auth=${AUTH_KIND}"
-              else
-                RESULT="FAILED"
-                DETAIL="railway up returned exit code ${RC}; auth=${AUTH_KIND}"
-              fi
-            fi
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
           fi
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+          exit ${RC}
 
-          printf 'result=%s\ndetail=%s\nsource_sha=%s\nutc=%s\n' \
-            "${RESULT}" "${DETAIL}" "${GITHUB_SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            > .railway-cli-result
+      - name: Verify deployed service status
+        if: success()
+        run: |
+          railway status
+          railway service status --service "${SERVICE_NAME}" --environment "${ENVIRONMENT_NAME}" --project "${PROJECT_ID}"
 
-          echo "Railway deploy result: ${RESULT} — ${DETAIL}"
-          if [ -f /tmp/railway-deploy.log ]; then
-            echo "--- Railway deploy log tail ---"
-            tail -n 80 /tmp/railway-deploy.log
-          fi
-          echo "result=${RESULT}" >> "${GITHUB_OUTPUT}"
-          echo "rc=${RC}" >> "${GITHUB_OUTPUT}"
-          exit 0
-
-      - name: Publish deploy result marker
+      - name: Record successful Railway target
+        if: success()
         shell: bash
         run: |
+          printf 'result=SUCCESS\nproject=%s\nenvironment=%s\nservice=%s\nsource_sha=%s\nutc=%s\n' \
+            "${PROJECT_ID}" "${ENVIRONMENT_NAME}" "${SERVICE_NAME}" "${GITHUB_SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > .railway-cli-result
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .railway-cli-result
-          if git diff --cached --quiet; then
-            echo "Result marker unchanged"
-            exit 0
+          if ! git diff --cached --quiet; then
+            git commit -m "Record Railway deploy success"
+            git pull --rebase origin main
+            git push origin HEAD:main
           fi
-          git commit -m "Record Railway deploy result: ${{ steps.railway.outputs.result }}"
-          git pull --rebase origin main
-          git push origin HEAD:main
-
-      - name: Fail workflow when Railway deploy failed
-        if: steps.railway.outputs.result != 'SUCCESS'
-        run: |
-          echo "Railway direct deploy did not succeed: ${{ steps.railway.outputs.result }}"
-          exit 1
