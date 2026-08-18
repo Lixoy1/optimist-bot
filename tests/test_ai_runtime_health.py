@@ -90,7 +90,7 @@ def _fake_chat_app(mood_key):
     return app, captured
 
 
-def test_all_normal_personality_modes_keep_followup_context():
+def test_base_hotfix_still_keeps_followup_context_for_private_fallback_path():
     expected = {
         "optimist": "OPTIMIST-PROMPT",
         "pessimist": "PESSIMIST-PROMPT",
@@ -102,13 +102,14 @@ def test_all_normal_personality_modes_keep_followup_context():
         result = asyncio.run(hotfixes.smart_get_llm_response(app, "А если теперь?", -100, "alex"))
         assert result == "готовый ответ"
         assert marker in captured["system"]
-        assert "Режим контекста: followup" in captured["system"]
+        assert "Контекстный режим: followup" in captured["system"]
         assert "Алекс → Лена" in captured["system"]
         assert "Лена → Алекс" in captured["system"]
-        assert captured["temperature"] == group_memory.GROUP_CHAT_TEMPERATURE
+        expected_temp = 0.68 if mood_key == "humor" else hotfixes.AI_RESPONSE_TEMPERATURE
+        assert captured["temperature"] == expected_temp
 
 
-def test_greeting_resets_old_topic_instead_of_leaking_polina():
+def test_base_hotfix_greeting_reset_prevents_topic_leakage():
     app, captured = _fake_chat_app("optimist")
     app.get_recent_messages = lambda chat_id, limit=40: [
         {"user": "Алекс", "text": "Оптимист нарисуй Полину", "reply_to_user": "", "ts": 1},
@@ -117,13 +118,13 @@ def test_greeting_resets_old_topic_instead_of_leaking_polina():
     ]
     result = asyncio.run(hotfixes.smart_get_llm_response(app, "привет ты оптимист", -100, "alex"))
     assert result == "готовый ответ"
-    assert "Режим контекста: reset" in captured["system"]
+    assert "Контекстный режим: reset" in captured["system"]
     assert "Полин" not in captured["system"]
-    assert "чистое приветствие" in captured["system"]
+    assert "самостоятельная реплика" in captured["system"]
 
 
-def test_context_classifier_matches_real_chat_examples():
-    # Base/private classifier stays conservative.
+def test_private_classifier_and_group_legacy_contract_are_both_explicit():
+    # Base/private classifier remains available for the old hotfix fallback path.
     assert hotfixes.context_mode("привет ты оптимист") == "reset"
     assert hotfixes.context_mode("Как ты?") == "reset"
     assert hotfixes.context_mode("О жив") == "reset"
@@ -131,11 +132,9 @@ def test_context_classifier_matches_real_chat_examples():
     assert hotfixes.context_mode("А если она дороже?") == "followup"
     assert hotfixes.context_mode("Что думаешь о новой функции?") == "normal"
 
-    # Group classifier intentionally preserves ambient conversation like the old bot.
-    assert group_memory.group_context_mode("Как ты?") == "ambient"
-    assert group_memory.group_context_mode("О жив") == "ambient"
-    assert group_memory.group_context_mode("Что там?") == "ambient"
-    assert group_memory.group_context_mode("Стендап любишь") == "normal"
+    # Production group brain no longer classifies topics; it passes one broad transcript.
+    for text in ["Как ты?", "О жив", "Что там?", "Стендап любишь", "Почему?"]:
+        assert group_memory.group_context_mode(text) == "legacy"
 
 
 def test_natural_draw_intents_accept_bot_addressing():
@@ -152,20 +151,20 @@ def test_fallback_is_transparent_not_motivational_template():
     assert "Живой" in hotfixes._fallback_response("Алекс", "Как ты?", "optimist")
 
 
-def test_investor_mode_preserves_specialized_reasoning_flow():
+def test_legacy_brain_preserves_specialized_investor_reasoning_flow():
     app, _ = _fake_chat_app("investor_genius")
     calls = []
 
-    async def original(user_text, chat_id, user_name):
+    async def specialized(user_text, chat_id, user_name):
         calls.append((user_text, chat_id, user_name))
         return "investor reasoning"
 
-    previous = hotfixes._ORIGINAL_GET_LLM_RESPONSE
+    previous = group_memory._BASE_GET_LLM
     try:
-        hotfixes._ORIGINAL_GET_LLM_RESPONSE = original
-        result = asyncio.run(group_memory._BASE_SMART(app, "разбери проект", -100, "alex"))
+        group_memory._BASE_GET_LLM = specialized
+        result = asyncio.run(group_memory.legacy_get_llm_response(app, hotfixes, "разбери проект", -100, "alex"))
     finally:
-        hotfixes._ORIGINAL_GET_LLM_RESPONSE = previous
+        group_memory._BASE_GET_LLM = previous
 
     assert result == "investor reasoning"
     assert calls == [("разбери проект", -100, "alex")]
