@@ -13,19 +13,16 @@ permissions:
 
 concurrency:
   group: railway-production
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     env:
       SECRET_RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-      SECRET_RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       SECRET_RAILWAY_PROJECT_TOKEN: ${{ secrets.RAILWAY_PROJECT_TOKEN }}
-      SECRET_RAILWAY_ACCESS_TOKEN: ${{ secrets.RAILWAY_ACCESS_TOKEN }}
       VAR_RAILWAY_TOKEN: ${{ vars.RAILWAY_TOKEN }}
-      VAR_RAILWAY_API_TOKEN: ${{ vars.RAILWAY_API_TOKEN }}
       PROJECT_ID: c4b740e5-149f-461d-a5cc-c58cb3881344
       ENVIRONMENT_NAME: production
       SERVICE_NAME: OptimistBot
@@ -40,39 +37,39 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install Railway CLI
-        run: npm install --global @railway/cli
-
-      - name: Configure Railway authentication
+      - name: Resolve Railway project token
         id: auth
         shell: bash
         run: |
           set -e
-          if [ -n "${SECRET_RAILWAY_TOKEN}" ]; then
-            echo "RAILWAY_TOKEN=${SECRET_RAILWAY_TOKEN}" >> "$GITHUB_ENV"
-            echo "mode=project-token" >> "$GITHUB_OUTPUT"
-          elif [ -n "${SECRET_RAILWAY_PROJECT_TOKEN}" ]; then
-            echo "RAILWAY_TOKEN=${SECRET_RAILWAY_PROJECT_TOKEN}" >> "$GITHUB_ENV"
-            echo "mode=project-token" >> "$GITHUB_OUTPUT"
-          elif [ -n "${VAR_RAILWAY_TOKEN}" ]; then
-            echo "RAILWAY_TOKEN=${VAR_RAILWAY_TOKEN}" >> "$GITHUB_ENV"
-            echo "mode=project-token" >> "$GITHUB_OUTPUT"
-          elif [ -n "${SECRET_RAILWAY_API_TOKEN}" ]; then
-            echo "RAILWAY_API_TOKEN=${SECRET_RAILWAY_API_TOKEN}" >> "$GITHUB_ENV"
-            echo "mode=api-token" >> "$GITHUB_OUTPUT"
-          elif [ -n "${SECRET_RAILWAY_ACCESS_TOKEN}" ]; then
-            echo "RAILWAY_API_TOKEN=${SECRET_RAILWAY_ACCESS_TOKEN}" >> "$GITHUB_ENV"
-            echo "mode=api-token" >> "$GITHUB_OUTPUT"
-          elif [ -n "${VAR_RAILWAY_API_TOKEN}" ]; then
-            echo "RAILWAY_API_TOKEN=${VAR_RAILWAY_API_TOKEN}" >> "$GITHUB_ENV"
-            echo "mode=api-token" >> "$GITHUB_OUTPUT"
+          TOKEN="${SECRET_RAILWAY_TOKEN}"
+          [ -n "$TOKEN" ] || TOKEN="${SECRET_RAILWAY_PROJECT_TOKEN}"
+          [ -n "$TOKEN" ] || TOKEN="${VAR_RAILWAY_TOKEN}"
+          if [ -z "$TOKEN" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
           else
-            echo "mode=browserless" >> "$GITHUB_OUTPUT"
-            echo "No Railway token found; starting browserless device login."
-            railway login --browserless
+            echo "RAILWAY_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+            echo "present=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Record missing token
+        if: steps.auth.outputs.present != 'true'
+        shell: bash
+        run: |
+          printf 'result=NO_TOKEN\nproject=%s\nenvironment=%s\nservice=%s\nsource_sha=%s\nutc=%s\n' \
+            "${PROJECT_ID}" "${ENVIRONMENT_NAME}" "${SERVICE_NAME}" "${GITHUB_SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > .railway-cli-result
+
+      - name: Stop when token is absent
+        if: steps.auth.outputs.present != 'true'
+        run: echo "RAILWAY_TOKEN is required" && exit 1
+
+      - name: Install Railway CLI
+        if: steps.auth.outputs.present == 'true'
+        run: npm install --global @railway/cli
+
       - name: Link real Railway project
+        if: steps.auth.outputs.present == 'true'
         run: |
           railway link \
             --project "${PROJECT_ID}" \
@@ -80,48 +77,49 @@ jobs:
             --service "${SERVICE_NAME}"
 
       - name: Show target status before deploy
+        if: steps.auth.outputs.present == 'true'
         run: railway status
 
       - name: Deploy Legacy Brain v3
+        if: steps.auth.outputs.present == 'true'
         id: deploy
         shell: bash
         run: |
-          set +e
           railway up \
             --project "${PROJECT_ID}" \
             --environment "${ENVIRONMENT_NAME}" \
             --service "${SERVICE_NAME}" \
             --message "Legacy Brain v3 ${GITHUB_SHA}" \
-            --ci \
-            > /tmp/railway-deploy.log 2>&1
-          RC=$?
-          cat /tmp/railway-deploy.log
-          if [ ${RC} -eq 0 ]; then
-            echo "result=SUCCESS" >> "$GITHUB_OUTPUT"
-          else
-            echo "result=FAILED" >> "$GITHUB_OUTPUT"
-          fi
-          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
-          exit ${RC}
+            --ci
 
       - name: Verify deployed service status
-        if: success()
+        if: success() && steps.auth.outputs.present == 'true'
         run: |
           railway status
           railway service status --service "${SERVICE_NAME}" --environment "${ENVIRONMENT_NAME}" --project "${PROJECT_ID}"
 
       - name: Record successful Railway target
-        if: success()
+        if: success() && steps.auth.outputs.present == 'true'
         shell: bash
         run: |
           printf 'result=SUCCESS\nproject=%s\nenvironment=%s\nservice=%s\nsource_sha=%s\nutc=%s\n' \
             "${PROJECT_ID}" "${ENVIRONMENT_NAME}" "${SERVICE_NAME}" "${GITHUB_SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             > .railway-cli-result
+
+      - name: Publish deploy result marker
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f .railway-cli-result ]; then
+            printf 'result=FAILED\nproject=%s\nenvironment=%s\nservice=%s\nsource_sha=%s\nutc=%s\n' \
+              "${PROJECT_ID}" "${ENVIRONMENT_NAME}" "${SERVICE_NAME}" "${GITHUB_SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              > .railway-cli-result
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .railway-cli-result
           if ! git diff --cached --quiet; then
-            git commit -m "Record Railway deploy success"
+            git commit -m "Record Railway deploy result"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
