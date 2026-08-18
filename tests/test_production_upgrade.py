@@ -1,5 +1,4 @@
 import datetime
-import importlib
 import os
 from pathlib import Path
 
@@ -82,6 +81,7 @@ def test_social_graph_uses_real_reply_edges(monkeypatch):
 
 def test_railway_config_present_and_points_to_entrypoint():
     cfg = Path("railway.toml").read_text(encoding="utf-8")
+    assert 'builder = "RAILPACK"' in cfg
     assert 'startCommand = "python optimist_entrypoint.py"' in cfg
     assert 'healthcheckPath = "/health"' in cfg
     assert 'restartPolicyType = "ALWAYS"' in cfg
