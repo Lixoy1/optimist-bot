@@ -1,4 +1,6 @@
 result=NO_TOKEN
-detail=No Railway credential found in tested GitHub Secrets/Variables names
-source_sha=e8f36f32ccfc06e4618c0c558fe9e37ac8c5e733
-utc=2026-08-18T16:30:36Z
+project=c4b740e5-149f-461d-a5cc-c58cb3881344
+environment=production
+service=OptimistBot
+source_sha=91dd901b87aa0484a5f867e675b8613554a64560
+utc=2026-08-18T19:22:32Z
