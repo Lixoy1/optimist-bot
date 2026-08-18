@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - ".railway-ci-trigger"
+      - ".github/workflows/railway-deploy.yml"
   workflow_dispatch:
 
 permissions:
