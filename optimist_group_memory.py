@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
-"""Group-chat conversation memory and live Groq inference diagnostics.
+"""Legacy-style conversation brain for Optimist Bot.
 
-This runtime layer restores the behavior Optimist had when it felt like a real
-participant in a Telegram group: it sees recent messages from all participants,
-remembers its own last replies, keeps the active topic for ambiguous short
-phrases, and still lets explicit new topics take priority.
+The original bot felt natural because it gave a capable chat model a broad,
+plain transcript and very few meta-rules. This module deliberately restores
+that contract while keeping the production improvements added later:
+- current Groq models;
+- persistent memory of the bot's own replies;
+- provider diagnostics;
+- safe fallback chain.
+
+No reset/followup/ambient state machine is used to decide what the model may
+see. The model receives one rolling Telegram transcript and resolves the topic
+itself, like the original implementation did.
 """
 
 import asyncio
 import os
-import re
 import time
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 
 
-GROUP_CONTEXT_MAX_MESSAGES = max(20, int(os.getenv("GROUP_CONTEXT_MAX_MESSAGES", "42")))
-GROUP_CONTEXT_MAX_CHARS = max(6000, int(os.getenv("GROUP_CONTEXT_MAX_CHARS", "18000")))
-GROUP_CHAT_TEMPERATURE = min(1.0, max(0.0, float(os.getenv("GROUP_CHAT_TEMPERATURE", "0.64"))))
-GROUP_GROQ_FALLBACK_MODEL = os.getenv("GROUP_GROQ_FALLBACK_MODEL", "qwen/qwen3.6-27b").strip()
-ASSISTANT_MEMORY_MAX = max(20, int(os.getenv("ASSISTANT_MEMORY_MAX", "120")))
+# Old code used CONTEXT_MAX_MESSAGES=25 human messages. We keep a slightly
+# larger unified window because it now also contains Optimist Bot turns.
+GROUP_CONTEXT_MAX_MESSAGES = max(25, int(os.getenv("GROUP_CONTEXT_MAX_MESSAGES", "36")))
+GROUP_CONTEXT_MAX_CHARS = max(8000, int(os.getenv("GROUP_CONTEXT_MAX_CHARS", "18000")))
+ASSISTANT_MEMORY_MAX = max(30, int(os.getenv("ASSISTANT_MEMORY_MAX", "160")))
+
+# Qwen 3.6 is Groq's current strong multi-turn/dialogue replacement for the
+# retired Llama 3.3 70B. GPT-OSS 120B stays the reasoning/quality fallback.
+LEGACY_DIALOGUE_MODEL = os.getenv("OPTIMIST_DIALOGUE_MODEL", "qwen/qwen3.6-27b").strip() or "qwen/qwen3.6-27b"
+GROUP_GROQ_FALLBACK_MODEL = os.getenv("GROUP_GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
+
+MODE_TEMPERATURES = {
+    "optimist": float(os.getenv("OPTIMIST_TEMP", "0.80")),
+    "pessimist": float(os.getenv("PESSIMIST_TEMP", "0.82")),
+    "humor": float(os.getenv("HUMOR_TEMP", "0.90")),
+    "mafioso": float(os.getenv("MAFIOSO_TEMP", "0.84")),
+}
 
 AI_DIAGNOSTICS: Dict[str, Any] = {
     "last_provider": "none",
@@ -31,52 +49,7 @@ AI_DIAGNOSTICS: Dict[str, Any] = {
     "last_ts": 0.0,
 }
 
-_BASE_SMART = None
 _BASE_GET_LLM = None
-
-_GREETING_RE = re.compile(
-    r"^(?:привет|приветик|здравствуй|здравствуйте|здорово|хай|hello|hi|"
-    r"привет\s+(?:ты\s+)?оптимист|ты\s+оптимист)[!?.\s]*$",
-    re.I,
-)
-
-_FOLLOWUP_RE = re.compile(
-    r"^(?:почему|зачем|а\s+если|и\s+что|а\s+что|тогда|а\s+как|и\s+как|"
-    r"а\s+он|а\s+она|а\s+они|а\s+это|и\s+это|это|он|она|они|да|нет|точно|"
-    r"серьезно|серьёзно|правда|дальше|продолжай|ну\s+и|и\?|а\?)\b",
-    re.I,
-)
-
-_AMBIENT_RE = re.compile(
-    r"^(?:как\s+дела|как\s+ты|ты\s+как|жив(?:ёшь|ешь)?|живой|о\s+жив|"
-    r"что\s+там|ч[её]\s+там|ну\s+чего|ну\s+что|что\s+нового|ну\s+как|"
-    r"как\s+оно|что\s+скажешь|чего\s+там)[!?.\s]*$",
-    re.I,
-)
-
-
-def _clean_addressing(text: str) -> str:
-    value = (text or "").strip()
-    value = re.sub(r"^@\w+\s*[,!:;\-]?\s*", "", value, flags=re.I)
-    value = re.sub(r"^(?:оптимист|бот)\s*[,!:;\-]?\s*", "", value, flags=re.I)
-    return value.strip()
-
-
-def group_context_mode(text: str, current_item: Optional[Dict[str, Any]] = None) -> str:
-    """Classify a group message without throwing away useful ambient context."""
-    cleaned = _clean_addressing(text).lower().strip()
-    if _GREETING_RE.fullmatch(cleaned):
-        return "reset"
-    if current_item and current_item.get("reply_to_user_id"):
-        return "followup"
-    if _FOLLOWUP_RE.search(cleaned):
-        return "followup"
-    if _AMBIENT_RE.fullmatch(cleaned):
-        return "ambient"
-    words = re.findall(r"[а-яёa-z0-9]+", cleaned, flags=re.I)
-    if len(words) <= 5 and any(token in cleaned for token in ["это", "он", "она", "они", "там", "тогда"]):
-        return "followup"
-    return "normal"
 
 
 def _assistant_memory(app, chat_id: int) -> List[Dict[str, Any]]:
@@ -84,30 +57,20 @@ def _assistant_memory(app, chat_id: int) -> List[Dict[str, Any]]:
     return raw if isinstance(raw, list) else []
 
 
-def _prior_group_history(app, chat_id: int, current_item: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _rolling_history(app, chat_id: int) -> List[Dict[str, Any]]:
+    """Merge human turns with persisted Optimist turns in chronological order."""
     humans = app.get_recent_messages(chat_id, limit=GROUP_CONTEXT_MAX_MESSAGES * 2)
     if humans:
-        # main_handler stores the current user message immediately before asking AI.
+        # The original catch-all stores the current user message before calling
+        # get_llm_response; exclude it from history because it is sent separately.
         humans = humans[:-1]
-    assistants = _assistant_memory(app, chat_id)
-    combined = [*humans, *assistants]
+    combined = [*humans, *_assistant_memory(app, chat_id)]
     combined.sort(key=lambda item: float(item.get("ts", 0.0)))
     return combined[-GROUP_CONTEXT_MAX_MESSAGES:]
 
 
-def _select_group_context(prior: List[Dict[str, Any]], mode: str) -> List[Dict[str, Any]]:
-    if mode == "reset":
-        return []
-    if mode == "followup":
-        return prior[-30:]
-    if mode == "ambient":
-        # Ambiguous phrases such as "что там?" or "живёшь?" should know what
-        # the group has been discussing, like the original bot did.
-        return prior[-26:]
-    return prior[-18:]
-
-
 def build_group_context(messages: List[Dict[str, Any]], max_chars: int = GROUP_CONTEXT_MAX_CHARS) -> str:
+    """Format a plain Telegram transcript, preserving participants and replies."""
     lines: List[str] = []
     used = 0
     for item in reversed(messages):
@@ -125,31 +88,68 @@ def build_group_context(messages: List[Dict[str, Any]], max_chars: int = GROUP_C
         lines.append(line)
         used += cost
     lines.reverse()
-    return "\n".join(lines) if lines else "Контекста нет."
+    return "\n".join(lines) if lines else "Контекста пока нет."
 
 
-def _groq_payload(model: str, system_prompt: str, user_text: str, max_tokens: int, temperature: float) -> Dict[str, Any]:
-    """Build a model-specific Groq Chat Completions request.
+def group_context_mode(text: str, current_item: Optional[Dict[str, Any]] = None) -> str:
+    """Compatibility helper: the legacy brain intentionally uses one mode."""
+    return "legacy"
 
-    GPT-OSS supports reasoning_effort plus include_reasoning, but not
-    reasoning_format. Qwen 3.6 supports reasoning_effort=none/default and
-    reasoning_format=hidden/parsed/raw.
-    """
+
+def _legacy_system_prompt(app, mood_key: str, user_name: str, context: str) -> str:
+    settings = app.chat_settings[str(getattr(app, "_legacy_chat_id", ""))] if False else None
+    mood = app.MOODS.get(mood_key, app.MOODS["optimist"])
+    # length/profanity are appended by the caller because they are chat-specific.
+    extra = ""
+    if mood_key == "humor":
+        extra = (
+            "\nЮмор должен цепляться за конкретную реплику или деталь из чата: наблюдение, подкол, callback, абсурд или самоирония. "
+            "Не объясняй шутку и не заканчивай каждый ответ советом."
+        )
+    elif mood_key == "mafioso":
+        extra = "\nЕсли в чате есть игровая тема, подхватывай её как живой участник, а не как справочник по Мафии."
+
+    return (
+        f"{mood['prompt']}{extra}\n"
+        f"Ты общаешься в живом Telegram-чате. Начинай ответ строго с @{user_name}, затем продолжай.\n"
+        "НЕ повторяй фразу пользователя. Не пиши 'ты спросил', 'по поводу', 'как я понял'.\n"
+        "Отвечай сразу по существу, учитывая весь приведённый контекст, но не пересказывай его дословно.\n"
+        "Контекст — реальная переписка нескольких людей, включая твои предыдущие ответы. Сам решай по смыслу, что относится к текущей реплике. "
+        "Не обнуляй тему по формальным признакам и не тащи старую тему, если новая реплика явно о другом.\n"
+        "Не превращай обычную беседу в консультацию, инструкцию или мотивационную речь без просьбы.\n\n"
+        f"Контекст последних сообщений:\n{context}"
+    )
+
+
+def _clamp_temperature(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _groq_payload(
+    model: str,
+    system_prompt: str,
+    user_text: str,
+    max_tokens: int,
+    temperature: float,
+    *,
+    reasoning: bool = False,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        "temperature": temperature,
+        "temperature": _clamp_temperature(temperature),
         "max_completion_tokens": max_tokens,
     }
-    if model.startswith("openai/gpt-oss"):
-        payload["reasoning_effort"] = "medium"
-        payload["include_reasoning"] = False
-    elif model.startswith("qwen/"):
-        payload["reasoning_effort"] = "none"
+    if model.startswith("qwen/"):
+        payload["reasoning_effort"] = "default" if reasoning else "none"
         payload["reasoning_format"] = "hidden"
+        payload["top_p"] = 0.90 if reasoning else 0.80
+    elif model.startswith("openai/gpt-oss"):
+        payload["reasoning_effort"] = "medium" if reasoning else "low"
+        payload["include_reasoning"] = False
     return payload
 
 
@@ -163,7 +163,7 @@ def _extract_content(data: Dict[str, Any]) -> Optional[str]:
         if isinstance(content, str) and content.strip():
             return content.strip()
     except Exception:
-        return None
+        pass
     return None
 
 
@@ -194,7 +194,16 @@ def ai_diag_text() -> str:
     return base
 
 
-async def groq_chat(app, model: str, system_prompt: str, user_text: str, max_tokens: int, temperature: float) -> Optional[str]:
+async def groq_chat(
+    app,
+    model: str,
+    system_prompt: str,
+    user_text: str,
+    max_tokens: int,
+    temperature: float,
+    *,
+    reasoning: bool = False,
+) -> Optional[str]:
     if not getattr(app, "GROQ_API_KEY", None) or not model:
         return None
     started = time.monotonic()
@@ -206,15 +215,15 @@ async def groq_chat(app, model: str, system_prompt: str, user_text: str, max_tok
                     "Authorization": f"Bearer {app.GROQ_API_KEY}",
                     "Content-Type": "application/json",
                 },
-                json=_groq_payload(model, system_prompt, user_text, max_tokens, temperature),
-                timeout=aiohttp.ClientTimeout(total=25),
+                json=_groq_payload(model, system_prompt, user_text, max_tokens, temperature, reasoning=reasoning),
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 data = await resp.json(content_type=None)
                 latency = int((time.monotonic() - started) * 1000)
                 if resp.status != 200:
                     detail = str(data)[:220]
                     _set_ai_diag("Groq", model, resp.status, latency, detail)
-                    app.logger.warning("Groq group chat %s -> %s: %s", model, resp.status, detail)
+                    app.logger.warning("Groq legacy brain %s -> %s: %s", model, resp.status, detail)
                     return None
                 content = _extract_content(data)
                 if content:
@@ -224,92 +233,74 @@ async def groq_chat(app, model: str, system_prompt: str, user_text: str, max_tok
     except Exception as exc:
         latency = int((time.monotonic() - started) * 1000)
         _set_ai_diag("Groq", model, None, latency, str(exc))
-        app.logger.warning("Groq group chat %s error: %s", model, exc)
+        app.logger.warning("Groq legacy brain %s error: %s", model, exc)
     return None
 
 
-async def group_smart_get_llm_response(app, hotfixes, user_text: str, chat_id: int, user_name: str) -> str:
-    global _BASE_SMART
+async def legacy_get_llm_response(app, hotfixes, user_text: str, chat_id: int, user_name: str) -> str:
+    """Restore the original broad-context, low-micromanagement reply contract."""
+    cid = str(chat_id)
+    settings = app.chat_settings[cid]
+    mood_key = settings.get("mood", "optimist")
 
-    mood_key = app.chat_settings[str(chat_id)].get("mood", "optimist")
-    # Keep private chats and the specialized investment reasoning flow unchanged.
-    if chat_id >= 0 or mood_key == "investor_genius":
-        return await _BASE_SMART(app, user_text, chat_id, user_name)
+    # Preserve the original specialized investor flow: it already has the
+    # strongest task-specific reasoning prompt in the old code.
+    if mood_key == "investor_genius" and _BASE_GET_LLM is not None:
+        response = await _BASE_GET_LLM(user_text, chat_id, user_name)
+        return response
 
-    settings = app.chat_settings[str(chat_id)]
     mood = app.MOODS.get(mood_key, app.MOODS["optimist"])
     length = app.RESPONSE_LENGTHS.get(
         settings.get("response_length", "medium"),
         app.RESPONSE_LENGTHS["medium"],
     )
     allow_prof = settings.get("allow_profanity", False)
-
-    humans = app.get_recent_messages(chat_id, limit=GROUP_CONTEXT_MAX_MESSAGES * 2)
-    current_item = humans[-1] if humans else None
-    prior = _prior_group_history(app, chat_id, current_item)
-    mode = group_context_mode(user_text, current_item)
-    selected = _select_group_context(prior, mode)
-    context = build_group_context(selected)
-    cleaned = app.clean_user_text_for_llm(user_text)
-
     prof_rule = (
-        "Мат можно использовать умеренно, если он естественен для текущего режима и чата."
+        "Мат можно использовать умеренно, если он уместен."
         if allow_prof
         else "Мат, грубость и оскорбления запрещены."
     )
-    mode_rule = {
-        "reset": (
-            "Это чистое приветствие или явный перезапуск общения. Ответь на него само по себе и не тащи старую тему."
-        ),
-        "followup": (
-            "Это продолжение. Восстанови точный референт из последних реплик участников И из последнего ответа Optimist Bot."
-        ),
-        "ambient": (
-            "Это короткая двусмысленная реплика вроде 'что там?', 'ну чего?', 'как дела?' или 'живёшь?'. "
-            "Она может относиться к текущей теме группы. Сначала естественно ответь на саму реплику, затем, если в истории есть очевидная активная тема, продолжи именно её."
-        ),
-        "normal": (
-            "Текущая реплика имеет приоритет. Используй историю группы только если она реально связана по смыслу; явную новую тему не подменяй старой."
-        ),
-    }[mode]
 
+    history = _rolling_history(app, chat_id)
+    context = build_group_context(history)
+    cleaned = app.clean_user_text_for_llm(user_text)
     system_prompt = (
-        f"{mood['prompt']}\n"
+        f"{_legacy_system_prompt(app, mood_key, user_name, context)}\n"
         f"{length['rule']}\n"
-        f"{prof_rule}\n"
-        "Ты не сервисный ассистент, а умный живой участник Telegram-группы. Ты следишь за беседой целиком: кто что сказал, кому ответили, "
-        "какая тема сейчас активна и что только что ответил ты сам.\n"
-        f"Режим контекста: {mode}. {mode_rule}\n"
-        "Не становись вялым и канцелярским. Не предлагай пошаговые планы без просьбы. Не добавляй мотивационную воду. "
-        "Можно шутить и цепляться за детали чата, но факты не выдумывай.\n"
-        "Если вопрос содержательный — рассуждай причинно и конкретно. Если это короткая живая реплика — отвечай живо, без лекции.\n"
-        f"Начинай ответ с @{user_name}. Не повторяй запрос дословно.\n\n"
-        f"Последний релевантный фрагмент группового разговора:\n{context}"
+        f"{prof_rule}"
     )
+    temperature = _clamp_temperature(MODE_TEMPERATURES.get(mood_key, 0.80))
 
-    # Quality-first Groq path. 120B stays primary; Qwen 3.6 is a dialogue
-    # fallback before the generic provider chain and smaller 20B model.
-    primary = str(getattr(app, "GROQ_MODEL", "") or "")
-    groq_models = [model for model in [primary, GROUP_GROQ_FALLBACK_MODEL] if model]
-    seen = set()
-    for model in groq_models:
-        if model in seen:
-            continue
-        seen.add(model)
-        answer = await groq_chat(app, model, system_prompt, cleaned, length["max_tokens"], GROUP_CHAT_TEMPERATURE)
+    # Dialogue first: Qwen 3.6 is explicitly designed for efficient general
+    # dialogue/multi-turn chat. The large GPT-OSS model is the quality fallback.
+    for model in [LEGACY_DIALOGUE_MODEL, GROUP_GROQ_FALLBACK_MODEL]:
+        answer = await groq_chat(
+            app,
+            model,
+            system_prompt,
+            cleaned,
+            length["max_tokens"],
+            temperature,
+            reasoning=False,
+        )
         if answer:
             return answer
 
+    # Preserve all old external fallbacks (Gemini, OpenRouter, GitHub Models).
     answer = await app.ask_llm(
         system_prompt,
         cleaned,
         length["max_tokens"],
-        temperature=GROUP_CHAT_TEMPERATURE,
+        temperature=temperature,
     )
     if answer:
         _set_ai_diag("fallback-chain", "configured", 200, 0)
         return answer
     return hotfixes._fallback_response(user_name, user_text, mood_key)
+
+
+# Backward-compatible public name used by existing tests/callers.
+group_smart_get_llm_response = legacy_get_llm_response
 
 
 async def _record_assistant_turn(app, chat_id: int, user_name: str, response: str) -> None:
@@ -321,7 +312,7 @@ async def _record_assistant_turn(app, chat_id: int, user_name: str, response: st
         memory = []
         app.chat_settings[cid]["assistant_memory"] = memory
     memory.append({
-        "text": response[:1600],
+        "text": response[:1800],
         "user": "Optimist Bot",
         "username": getattr(app, "BOT_USERNAME", None) or "optimist_bot",
         "user_id": getattr(app, "BOT_ID", None) or 0,
@@ -338,12 +329,12 @@ async def _record_assistant_turn(app, chat_id: int, user_name: str, response: st
 
 
 async def probe_groq_inference(app) -> Dict[str, Dict[str, Any]]:
-    """Real completion probes: verifies that the Railway key can perform inference."""
+    """Real completion probes using the same models as the production brain."""
     if not getattr(app, "GROQ_API_KEY", None):
         return {"Groq inference": {"ok": False, "status": None, "detail": "key not configured"}}
 
     models: List[str] = []
-    for model in [str(getattr(app, "GROQ_MODEL", "") or ""), GROUP_GROQ_FALLBACK_MODEL]:
+    for model in [LEGACY_DIALOGUE_MODEL, GROUP_GROQ_FALLBACK_MODEL]:
         if model and model not in models:
             models.append(model)
 
@@ -360,10 +351,11 @@ async def probe_groq_inference(app) -> Dict[str, Dict[str, Any]]:
                     },
                     json=_groq_payload(
                         model,
-                        "Health check. Reply with exactly OK.",
+                        "Reply with exactly OK.",
                         "ping",
                         24,
                         0.0,
+                        reasoning=False,
                     ),
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
@@ -387,28 +379,20 @@ async def probe_groq_inference(app) -> Dict[str, Dict[str, Any]]:
 
 
 def install(app, hotfixes) -> None:
-    """Install group-specific dialogue memory after the existing hotfix layer."""
-    global _BASE_SMART, _BASE_GET_LLM
-    if _BASE_SMART is None:
-        _BASE_SMART = hotfixes.smart_get_llm_response
+    """Install one legacy-style brain instead of stacked context classifiers."""
+    global _BASE_GET_LLM
     if _BASE_GET_LLM is None:
         _BASE_GET_LLM = app.get_llm_response
 
-    async def _group_smart(user_text: str, chat_id: int, user_name: str) -> str:
-        response = await group_smart_get_llm_response(app, hotfixes, user_text, chat_id, user_name)
-        if chat_id < 0:
-            await _record_assistant_turn(app, chat_id, user_name, response)
+    async def _legacy_brain(user_text: str, chat_id: int, user_name: str) -> str:
+        response = await legacy_get_llm_response(app, hotfixes, user_text, chat_id, user_name)
+        await _record_assistant_turn(app, chat_id, user_name, response)
         return response
 
-    # Keep the public hotfix lookup group-aware for tests and any future caller,
-    # while making app.get_llm_response persist the bot's own turns.
-    hotfixes.smart_get_llm_response = lambda runtime_app, user_text, chat_id, user_name: group_smart_get_llm_response(
-        runtime_app, hotfixes, user_text, chat_id, user_name
-    )
-    app.get_llm_response = _group_smart
+    app.get_llm_response = _legacy_brain
     app.logger.info(
-        "🧠 Group memory installed: humans+bot replies, max=%s, ambient topic mode, Groq primary=%s quality fallback=%s",
+        "🧠 Legacy brain installed: transcript=%s turns, dialogue=%s, reasoning fallback=%s, bot replies persisted",
         GROUP_CONTEXT_MAX_MESSAGES,
-        getattr(app, "GROQ_MODEL", "none"),
-        GROUP_GROQ_FALLBACK_MODEL or "none",
+        LEGACY_DIALOGUE_MODEL,
+        GROUP_GROQ_FALLBACK_MODEL,
     )
