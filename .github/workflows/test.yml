@@ -37,6 +37,7 @@ jobs:
           test ! -f optimist_features.py || python -m py_compile optimist_features.py
           test ! -f optimist_hotfixes.py || python -m py_compile optimist_hotfixes.py
           test ! -f optimist_ai_runtime.py || python -m py_compile optimist_ai_runtime.py
+          test ! -f optimist_group_memory.py || python -m py_compile optimist_group_memory.py
 
       - name: Run unit tests
         env:

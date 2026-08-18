@@ -10,6 +10,7 @@ import optimist_bot_complete_final as app
 import optimist_entrypoint as entry
 import optimist_features as features
 import optimist_hotfixes as hotfixes
+import optimist_group_memory as group_memory
 
 
 def test_entrypoint_uses_persistent_data_dir():
@@ -107,9 +108,12 @@ def test_smart_context_keeps_reply_relationships():
     assert "Никита → Алекс: Что обсуждаем?" in context
 
 
-def test_hotfix_is_installed_on_runtime_module():
-    assert app.get_llm_response.__module__ == "optimist_hotfixes"
+def test_runtime_layers_are_installed_in_expected_modules():
+    # Text replies in groups are intentionally upgraded by the dedicated group-memory layer.
+    assert app.get_llm_response.__module__ == "optimist_group_memory"
+    # Image generation remains owned by the existing image/API hotfix layer.
     assert app.generate_image.__module__ == "optimist_hotfixes"
+    assert entry.group_memory is group_memory
 
 
 def test_railway_config_present_and_points_to_entrypoint():

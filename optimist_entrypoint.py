@@ -6,7 +6,8 @@ Keeps the original bot file untouched while adding:
 - /status and /diagnose diagnostics,
 - /missed [hours] rich catch-up summary,
 - weekly awards, social graph and crypto alerts,
-- smarter chat replies and current image provider fallbacks,
+- smarter group-chat memory with bot-turn persistence,
+- current image provider fallbacks,
 - current AI model routing with stale-model migration,
 - extension routers registered before the original catch-all handler.
 """
@@ -27,6 +28,7 @@ import optimist_bot_complete_final as app
 import optimist_features as features
 import optimist_hotfixes as hotfixes
 import optimist_ai_runtime as ai_runtime
+import optimist_group_memory as group_memory
 
 
 BOOT_TS = time.time()
@@ -46,6 +48,7 @@ app.SETTINGS_FILE = os.path.join(DATA_DIR, DATA_FILE_NAME)
 # Runtime-only patches keep the large original file unchanged and easy to roll back.
 ai_runtime.install(app)
 hotfixes.install(app)
+group_memory.install(app, hotfixes)
 
 extension_router = Router(name="optimist_production_extensions")
 
@@ -102,6 +105,7 @@ async def cmd_status(message: types.Message):
         telegram_state = "🔴"
 
     last_image = html.escape(hotfixes.image_diag_text())
+    last_ai = html.escape(group_memory.ai_diag_text())
     modes = ai_runtime.mode_contract(app)
     text = (
         "🤖 <b>OPTIMIST STATUS</b>\n\n"
@@ -111,6 +115,8 @@ async def cmd_status(message: types.Message):
         f"{_provider_state('OPENROUTER_API_KEY')} OpenRouter\n"
         f"{_provider_state('GITHUB_MODELS_TOKEN') if os.getenv('GITHUB_MODELS_TOKEN') else _provider_state('GITHUB_TOKEN')} GitHub Models\n"
         "🧠 Smart replies: <b>ON</b>\n"
+        "🗣 Group memory: <b>humans + bot replies</b>\n"
+        f"🧪 Последний AI: <code>{last_ai}</code>\n"
         f"🎭 Режимов: <b>{len(modes)}</b>\n\n"
         "<b>Эффективные модели</b>\n"
         f"{_model_lines()}\n\n"
@@ -123,6 +129,7 @@ async def cmd_status(message: types.Message):
         f"⏱ Uptime: <b>{uptime}</b>\n"
         f"💬 Сообщений в этом чате: <b>{stats.get('total_messages', 0)}</b>\n"
         f"🧠 В памяти для summary: <b>{len(stats.get('messages', []))}</b>\n"
+        f"🤖 Ответов бота в памяти: <b>{len(app.chat_settings[cid].get('assistant_memory', []))}</b>\n"
         f"🏠 Известных чатов: <b>{len(app.chat_settings)}</b>\n"
         f"💾 Storage: <code>{html.escape(app.SETTINGS_FILE)}</code> ({storage_kb:.1f} KB)\n"
         f"🕒 Сейчас: <b>{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</b>"
@@ -132,7 +139,7 @@ async def cmd_status(message: types.Message):
 
 @extension_router.message(Command("diagnose"))
 async def cmd_diagnose(message: types.Message):
-    status = await message.reply("🧪 Проверяю AI API и режимы без вывода секретов...")
+    status = await message.reply("🧪 Проверяю AI API, Groq inference и режимы без вывода секретов...")
 
     telegram_ok = True
     try:
@@ -141,6 +148,7 @@ async def cmd_diagnose(message: types.Message):
         telegram_ok = False
 
     probes = await ai_runtime.probe_apis(app)
+    probes.update(await group_memory.probe_groq_inference(app))
     lines = [
         "🧪 <b>OPTIMIST DIAGNOSTICS</b>",
         "",
@@ -158,7 +166,14 @@ async def cmd_diagnose(message: types.Message):
         suffix = f" [HTTP {http_status}]" if http_status else ""
         lines.append(f"{icon} {html.escape(name)}{suffix}: <code>{detail}</code>")
 
-    lines.extend(["", "🎭 <b>Режимы</b>"])
+    lines.extend([
+        "",
+        "🗣 <b>Память групп</b>",
+        f"🟢 human messages + bot replies; window={group_memory.GROUP_CONTEXT_MAX_MESSAGES}",
+        f"🟢 quality Groq fallback: <code>{html.escape(group_memory.GROUP_GROQ_FALLBACK_MODEL or 'off')}</code>",
+        "",
+        "🎭 <b>Режимы</b>",
+    ])
     for key, name in ai_runtime.mode_contract(app).items():
         lines.append(f"🟢 <code>{html.escape(key)}</code> — {html.escape(name)}")
 
@@ -261,8 +276,8 @@ async def production_startup():
     existing = {cmd.command for cmd in current}
     additions = []
     local_commands = [
-        BotCommand(command="status", description="Состояние и uptime бота"),
-        BotCommand(command="diagnose", description="Проверить AI API и режимы"),
+        BotCommand(command="status", description="Состояние, AI и память бота"),
+        BotCommand(command="diagnose", description="Проверить AI API и Groq inference"),
         BotCommand(command="missed", description="Что пропустил за N часов"),
         *features.FEATURE_COMMANDS,
     ]
