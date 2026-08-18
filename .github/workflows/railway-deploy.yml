@@ -7,6 +7,9 @@ on:
       - ".railway-ci-trigger"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
   group: railway-production
   cancel-in-progress: false
@@ -14,7 +17,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
       PROJECT_ID: df8e411e-b627-44f4-ba5a-d0683169878b
@@ -23,27 +26,80 @@ jobs:
     steps:
       - name: Checkout current main
         uses: actions/checkout@v4
-
-      - name: Require Railway project token
-        shell: bash
-        run: |
-          if [ -z "${RAILWAY_TOKEN}" ]; then
-            echo "::error::GitHub secret RAILWAY_TOKEN is not configured; cannot use direct CLI deploy fallback."
-            exit 2
-          fi
+        with:
+          ref: main
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Install current Railway CLI
-        run: npm install --global @railway/cli
-
-      - name: Deploy current repository to OptimistBot
+      - name: Run direct Railway deploy
+        id: railway
+        shell: bash
         run: |
-          railway up --ci \
-            --project "${PROJECT_ID}" \
-            --environment "${ENVIRONMENT_ID}" \
-            --service "${SERVICE_ID}" \
-            --message "Legacy Brain v3 ${GITHUB_SHA}"
+          set +e
+          RESULT="UNKNOWN"
+          DETAIL=""
+
+          if [ -z "${RAILWAY_TOKEN}" ]; then
+            RESULT="NO_TOKEN"
+            DETAIL="GitHub secret RAILWAY_TOKEN is not configured"
+            RC=2
+          else
+            npm install --global @railway/cli > /tmp/railway-install.log 2>&1
+            INSTALL_RC=$?
+            if [ ${INSTALL_RC} -ne 0 ]; then
+              RESULT="CLI_INSTALL_FAILED"
+              DETAIL="Railway CLI installation failed"
+              RC=${INSTALL_RC}
+            else
+              railway up \
+                --project "${PROJECT_ID}" \
+                --environment "${ENVIRONMENT_ID}" \
+                --service "${SERVICE_ID}" \
+                --message "Legacy Brain v3 ${GITHUB_SHA}" \
+                > /tmp/railway-deploy.log 2>&1
+              RC=$?
+              if [ ${RC} -eq 0 ]; then
+                RESULT="SUCCESS"
+                DETAIL="railway up reached successful terminal status"
+              else
+                RESULT="FAILED"
+                DETAIL="railway up returned exit code ${RC}"
+              fi
+            fi
+          fi
+
+          printf 'result=%s\ndetail=%s\nsource_sha=%s\nutc=%s\n' \
+            "${RESULT}" "${DETAIL}" "${GITHUB_SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > .railway-cli-result
+
+          echo "Railway deploy result: ${RESULT} — ${DETAIL}"
+          if [ -f /tmp/railway-deploy.log ]; then
+            echo "--- Railway deploy log tail ---"
+            tail -n 80 /tmp/railway-deploy.log
+          fi
+          echo "result=${RESULT}" >> "${GITHUB_OUTPUT}"
+          echo "rc=${RC}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Publish deploy result marker
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .railway-cli-result
+          if git diff --cached --quiet; then
+            echo "Result marker unchanged"
+            exit 0
+          fi
+          git commit -m "Record Railway deploy result: ${{ steps.railway.outputs.result }}"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Fail workflow when Railway deploy failed
+        if: steps.railway.outputs.result != 'SUCCESS'
+        run: |
+          echo "Railway direct deploy did not succeed: ${{ steps.railway.outputs.result }}"
+          exit 1
