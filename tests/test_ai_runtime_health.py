@@ -74,8 +74,6 @@ def _fake_chat_app(mood_key):
         chat_settings=settings,
         MOODS=moods,
         RESPONSE_LENGTHS={"medium": {"rule": "MEDIUM-RULE", "max_tokens": 500}},
-        # Production stores the current message before building context, so the
-        # last item is intentionally excluded by smart_get_llm_response().
         get_recent_messages=lambda chat_id, limit=40: [
             {"user": "Лена", "text": "Мне нравится этот вариант", "reply_to_user": ""},
             {"user": "Алекс", "text": "Почему?", "reply_to_user": "Лена"},
@@ -89,7 +87,7 @@ def _fake_chat_app(mood_key):
     return app, captured
 
 
-def test_all_normal_personality_modes_keep_smart_context():
+def test_all_normal_personality_modes_keep_followup_context():
     expected = {
         "optimist": "OPTIMIST-PROMPT",
         "pessimist": "PESSIMIST-PROMPT",
@@ -101,13 +99,50 @@ def test_all_normal_personality_modes_keep_smart_context():
         result = asyncio.run(hotfixes.smart_get_llm_response(app, "А если теперь?", -100, "alex"))
         assert result == "готовый ответ"
         assert marker in captured["system"]
-        assert "не отвечаешь на каждое сообщение изолированно" in captured["system"]
+        assert "Контекстный режим: followup" in captured["system"]
         assert "Алекс → Лена" in captured["system"]
         assert "Лена → Алекс" in captured["system"]
         if mood_key == "humor":
-            assert captured["temperature"] == 0.70
+            assert captured["temperature"] == 0.68
         else:
             assert captured["temperature"] == hotfixes.AI_RESPONSE_TEMPERATURE
+
+
+def test_greeting_resets_old_topic_instead_of_leaking_polina():
+    app, captured = _fake_chat_app("optimist")
+    app.get_recent_messages = lambda chat_id, limit=40: [
+        {"user": "Алекс", "text": "Оптимист нарисуй Полину", "reply_to_user": ""},
+        {"user": "Бот", "text": "Опиши Полину", "reply_to_user": "Алекс"},
+        {"user": "Алекс", "text": "привет ты оптимист", "reply_to_user": ""},
+    ]
+    result = asyncio.run(hotfixes.smart_get_llm_response(app, "привет ты оптимист", -100, "alex"))
+    assert result == "готовый ответ"
+    assert "Контекстный режим: reset" in captured["system"]
+    assert "Полин" not in captured["system"]
+    assert "На приветствия" in captured["system"]
+
+
+def test_context_classifier_matches_real_chat_examples():
+    assert hotfixes.context_mode("привет ты оптимист") == "reset"
+    assert hotfixes.context_mode("Как ты?") == "reset"
+    assert hotfixes.context_mode("О жив") == "reset"
+    assert hotfixes.context_mode("Почему?") == "followup"
+    assert hotfixes.context_mode("А если она дороже?") == "followup"
+    assert hotfixes.context_mode("Что думаешь о новой функции?") == "normal"
+
+
+def test_natural_draw_intents_accept_bot_addressing():
+    assert hotfixes.normalize_draw_text("нарисуй Полину") == "нарисуй Полину"
+    assert hotfixes.normalize_draw_text("Оптимист нарисуй Полину") == "нарисуй Полину"
+    assert hotfixes.normalize_draw_text("Оптимист, нарисуй Полину") == "нарисуй Полину"
+    assert hotfixes.normalize_draw_text("бот: сделай картинку кота") == "сделай картинку кота"
+    assert hotfixes.normalize_draw_text("привет нарисуй Полину") is None
+
+
+def test_fallback_is_transparent_not_motivational_template():
+    assert "AI-провайдер" in hotfixes._fallback_response("Алекс", "Что думаешь?", "optimist")
+    assert "Разберёмся и вытащим" not in hotfixes._fallback_response("Алекс", "Что думаешь?", "optimist")
+    assert "Живой" in hotfixes._fallback_response("Алекс", "Как ты?", "optimist")
 
 
 def test_investor_mode_preserves_specialized_reasoning_flow():
