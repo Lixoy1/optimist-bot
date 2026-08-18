@@ -41,4 +41,4 @@ jobs:
           TG_TOKEN: "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
           DATA_DIR: "/tmp/optimist-test-data"
         run: |
-          if [ -d tests ]; then pytest -q; else echo "No tests directory on this branch"; fi
+          if [ -d tests ]; then python -m pytest -q; else echo "No tests directory on this branch"; fi
