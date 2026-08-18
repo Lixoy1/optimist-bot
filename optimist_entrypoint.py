@@ -3,10 +3,11 @@
 
 Keeps the original bot file untouched while adding:
 - persistent JSON storage through DATA_DIR (Railway Volume-friendly),
-- /status diagnostics,
+- /status and /diagnose diagnostics,
 - /missed [hours] rich catch-up summary,
 - weekly awards, social graph and crypto alerts,
 - smarter chat replies and current image provider fallbacks,
+- current AI model routing with stale-model migration,
 - extension routers registered before the original catch-all handler.
 """
 
@@ -25,6 +26,7 @@ from aiogram.types import BotCommand
 import optimist_bot_complete_final as app
 import optimist_features as features
 import optimist_hotfixes as hotfixes
+import optimist_ai_runtime as ai_runtime
 
 
 BOOT_TS = time.time()
@@ -42,6 +44,7 @@ except OSError as exc:
 app.SETTINGS_FILE = os.path.join(DATA_DIR, DATA_FILE_NAME)
 
 # Runtime-only patches keep the large original file unchanged and easy to roll back.
+ai_runtime.install(app)
 hotfixes.install(app)
 
 extension_router = Router(name="optimist_production_extensions")
@@ -72,6 +75,18 @@ def _provider_state(env_name: str) -> str:
     return "🟢" if os.getenv(env_name) else "⚪"
 
 
+def _model_lines() -> str:
+    models = ai_runtime.effective_models(app)
+    return (
+        f"🧠 Groq: <code>{html.escape(models['groq'])}</code>\n"
+        f"⚡ Groq fast: <code>{html.escape(models['groq_fast'])}</code>\n"
+        f"✨ Gemini: <code>{html.escape(models['gemini'])}</code>\n"
+        f"🖼 Gemini Image: <code>{html.escape(models['gemini_image'])}</code>\n"
+        f"🧩 OpenRouter reasoning: <code>{html.escape(models['openrouter_reasoning'])}</code>\n"
+        f"🐙 GitHub Models: <code>{html.escape(models['github'])}</code>"
+    )
+
+
 @extension_router.message(Command("status"))
 async def cmd_status(message: types.Message):
     cid = str(message.chat.id)
@@ -87,6 +102,7 @@ async def cmd_status(message: types.Message):
         telegram_state = "🔴"
 
     last_image = html.escape(hotfixes.image_diag_text())
+    modes = ai_runtime.mode_contract(app)
     text = (
         "🤖 <b>OPTIMIST STATUS</b>\n\n"
         f"{telegram_state} Telegram API\n"
@@ -94,7 +110,10 @@ async def cmd_status(message: types.Message):
         f"{_provider_state('GEMINI_API_KEY')} Gemini\n"
         f"{_provider_state('OPENROUTER_API_KEY')} OpenRouter\n"
         f"{_provider_state('GITHUB_MODELS_TOKEN') if os.getenv('GITHUB_MODELS_TOKEN') else _provider_state('GITHUB_TOKEN')} GitHub Models\n"
-        "🧠 Smart replies: <b>ON</b>\n\n"
+        "🧠 Smart replies: <b>ON</b>\n"
+        f"🎭 Режимов: <b>{len(modes)}</b>\n\n"
+        "<b>Эффективные модели</b>\n"
+        f"{_model_lines()}\n\n"
         "🎨 <b>Image providers</b>\n"
         f"{_provider_state('PIXAZO_API_KEY')} Pixazo\n"
         f"{_provider_state('GEMINI_API_KEY')} Gemini Image\n"
@@ -109,6 +128,46 @@ async def cmd_status(message: types.Message):
         f"🕒 Сейчас: <b>{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</b>"
     )
     await message.reply(text)
+
+
+@extension_router.message(Command("diagnose"))
+async def cmd_diagnose(message: types.Message):
+    status = await message.reply("🧪 Проверяю AI API и режимы без вывода секретов...")
+
+    telegram_ok = True
+    try:
+        await app.bot.get_me()
+    except Exception:
+        telegram_ok = False
+
+    probes = await ai_runtime.probe_apis(app)
+    lines = [
+        "🧪 <b>OPTIMIST DIAGNOSTICS</b>",
+        "",
+        f"{'🟢' if telegram_ok else '🔴'} Telegram API",
+    ]
+    for name, info in probes.items():
+        if info.get("ok"):
+            icon = "🟢"
+        elif info.get("status") is None:
+            icon = "⚪"
+        else:
+            icon = "🔴"
+        detail = html.escape(str(info.get("detail") or ""))
+        http_status = info.get("status")
+        suffix = f" [HTTP {http_status}]" if http_status else ""
+        lines.append(f"{icon} {html.escape(name)}{suffix}: <code>{detail}</code>")
+
+    lines.extend(["", "🎭 <b>Режимы</b>"])
+    for key, name in ai_runtime.mode_contract(app).items():
+        lines.append(f"🟢 <code>{html.escape(key)}</code> — {html.escape(name)}")
+
+    lines.extend(["", "<b>Активные модели</b>", _model_lines()])
+    final_text = "\n".join(lines)
+    try:
+        await status.edit_text(final_text)
+    except Exception:
+        await message.reply(final_text)
 
 
 def _recent_messages(chat_id: int, hours: int):
@@ -203,6 +262,7 @@ async def production_startup():
     additions = []
     local_commands = [
         BotCommand(command="status", description="Состояние и uptime бота"),
+        BotCommand(command="diagnose", description="Проверить AI API и режимы"),
         BotCommand(command="missed", description="Что пропустил за N часов"),
         *features.FEATURE_COMMANDS,
     ]
