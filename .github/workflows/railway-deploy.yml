@@ -1,0 +1,49 @@
+name: Deploy Optimist to Railway
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".railway-ci-trigger"
+  workflow_dispatch:
+
+concurrency:
+  group: railway-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      PROJECT_ID: df8e411e-b627-44f4-ba5a-d0683169878b
+      SERVICE_ID: a99d6791-d40c-4fc2-94ea-5582af2de0c8
+      ENVIRONMENT_ID: 1d28a49c-3e1e-4d14-bf18-1228e8eb638d
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+
+      - name: Require Railway project token
+        shell: bash
+        run: |
+          if [ -z "${RAILWAY_TOKEN}" ]; then
+            echo "::error::GitHub secret RAILWAY_TOKEN is not configured; cannot use direct CLI deploy fallback."
+            exit 2
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install current Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Deploy current repository to OptimistBot
+        run: |
+          railway up --ci \
+            --project "${PROJECT_ID}" \
+            --environment "${ENVIRONMENT_ID}" \
+            --service "${SERVICE_ID}" \
+            --message "Legacy Brain v3 ${GITHUB_SHA}"
