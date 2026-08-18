@@ -32,10 +32,11 @@ def test_group_context_contains_people_and_bot_reply():
     assert "красные флаги" in text
 
 
-def test_gpt_oss_request_uses_hidden_medium_reasoning():
+def test_gpt_oss_request_uses_supported_medium_reasoning_contract():
     payload = gm._groq_payload("openai/gpt-oss-120b", "system", "user", 500, 0.64)
     assert payload["reasoning_effort"] == "medium"
-    assert payload["reasoning_format"] == "hidden"
+    assert payload["include_reasoning"] is False
+    assert "reasoning_format" not in payload
     assert payload["max_completion_tokens"] == 500
 
 
@@ -43,6 +44,7 @@ def test_qwen_quality_fallback_uses_dialogue_mode():
     payload = gm._groq_payload("qwen/qwen3.6-27b", "system", "user", 500, 0.64)
     assert payload["reasoning_effort"] == "none"
     assert payload["reasoning_format"] == "hidden"
+    assert "include_reasoning" not in payload
 
 
 def test_group_prompt_recreates_ambient_topic_behavior(monkeypatch):
