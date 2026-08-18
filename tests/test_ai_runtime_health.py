@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import optimist_ai_runtime as runtime
 import optimist_hotfixes as hotfixes
+import optimist_group_memory as group_memory
 
 
 class _Logger:
@@ -75,14 +76,16 @@ def _fake_chat_app(mood_key):
         MOODS=moods,
         RESPONSE_LENGTHS={"medium": {"rule": "MEDIUM-RULE", "max_tokens": 500}},
         get_recent_messages=lambda chat_id, limit=40: [
-            {"user": "Лена", "text": "Мне нравится этот вариант", "reply_to_user": ""},
-            {"user": "Алекс", "text": "Почему?", "reply_to_user": "Лена"},
-            {"user": "Лена", "text": "Потому что он логичнее", "reply_to_user": "Алекс"},
-            {"user": "Алекс", "text": "А если теперь?", "reply_to_user": "Лена"},
+            {"user": "Лена", "text": "Мне нравится этот вариант", "reply_to_user": "", "ts": 1},
+            {"user": "Алекс", "text": "Почему?", "reply_to_user": "Лена", "ts": 2},
+            {"user": "Лена", "text": "Потому что он логичнее", "reply_to_user": "Алекс", "ts": 3},
+            {"user": "Алекс", "text": "А если теперь?", "reply_to_user": "Лена", "ts": 4},
         ],
         clean_user_text_for_llm=lambda text: text,
         ask_llm=ask_llm,
         local_fallback=lambda name, mood: "fallback",
+        GROQ_API_KEY=None,
+        GROQ_MODEL="openai/gpt-oss-120b",
     )
     return app, captured
 
@@ -99,36 +102,40 @@ def test_all_normal_personality_modes_keep_followup_context():
         result = asyncio.run(hotfixes.smart_get_llm_response(app, "А если теперь?", -100, "alex"))
         assert result == "готовый ответ"
         assert marker in captured["system"]
-        assert "Контекстный режим: followup" in captured["system"]
+        assert "Режим контекста: followup" in captured["system"]
         assert "Алекс → Лена" in captured["system"]
         assert "Лена → Алекс" in captured["system"]
-        if mood_key == "humor":
-            assert captured["temperature"] == 0.68
-        else:
-            assert captured["temperature"] == hotfixes.AI_RESPONSE_TEMPERATURE
+        assert captured["temperature"] == group_memory.GROUP_CHAT_TEMPERATURE
 
 
 def test_greeting_resets_old_topic_instead_of_leaking_polina():
     app, captured = _fake_chat_app("optimist")
     app.get_recent_messages = lambda chat_id, limit=40: [
-        {"user": "Алекс", "text": "Оптимист нарисуй Полину", "reply_to_user": ""},
-        {"user": "Бот", "text": "Опиши Полину", "reply_to_user": "Алекс"},
-        {"user": "Алекс", "text": "привет ты оптимист", "reply_to_user": ""},
+        {"user": "Алекс", "text": "Оптимист нарисуй Полину", "reply_to_user": "", "ts": 1},
+        {"user": "Бот", "text": "Опиши Полину", "reply_to_user": "Алекс", "ts": 2},
+        {"user": "Алекс", "text": "привет ты оптимист", "reply_to_user": "", "ts": 3},
     ]
     result = asyncio.run(hotfixes.smart_get_llm_response(app, "привет ты оптимист", -100, "alex"))
     assert result == "готовый ответ"
-    assert "Контекстный режим: reset" in captured["system"]
+    assert "Режим контекста: reset" in captured["system"]
     assert "Полин" not in captured["system"]
-    assert "На приветствия" in captured["system"]
+    assert "чистое приветствие" in captured["system"]
 
 
 def test_context_classifier_matches_real_chat_examples():
+    # Base/private classifier stays conservative.
     assert hotfixes.context_mode("привет ты оптимист") == "reset"
     assert hotfixes.context_mode("Как ты?") == "reset"
     assert hotfixes.context_mode("О жив") == "reset"
     assert hotfixes.context_mode("Почему?") == "followup"
     assert hotfixes.context_mode("А если она дороже?") == "followup"
     assert hotfixes.context_mode("Что думаешь о новой функции?") == "normal"
+
+    # Group classifier intentionally preserves ambient conversation like the old bot.
+    assert group_memory.group_context_mode("Как ты?") == "ambient"
+    assert group_memory.group_context_mode("О жив") == "ambient"
+    assert group_memory.group_context_mode("Что там?") == "ambient"
+    assert group_memory.group_context_mode("Стендап любишь") == "normal"
 
 
 def test_natural_draw_intents_accept_bot_addressing():
@@ -156,7 +163,7 @@ def test_investor_mode_preserves_specialized_reasoning_flow():
     previous = hotfixes._ORIGINAL_GET_LLM_RESPONSE
     try:
         hotfixes._ORIGINAL_GET_LLM_RESPONSE = original
-        result = asyncio.run(hotfixes.smart_get_llm_response(app, "разбери проект", -100, "alex"))
+        result = asyncio.run(group_memory._BASE_SMART(app, "разбери проект", -100, "alex"))
     finally:
         hotfixes._ORIGINAL_GET_LLM_RESPONSE = previous
 
