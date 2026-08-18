@@ -6,6 +6,7 @@ Keeps the original bot file untouched while adding:
 - /status diagnostics,
 - /missed [hours] rich catch-up summary,
 - weekly awards, social graph and crypto alerts,
+- smarter chat replies and current image provider fallbacks,
 - extension routers registered before the original catch-all handler.
 """
 
@@ -23,6 +24,7 @@ from aiogram.types import BotCommand
 
 import optimist_bot_complete_final as app
 import optimist_features as features
+import optimist_hotfixes as hotfixes
 
 
 BOOT_TS = time.time()
@@ -38,6 +40,9 @@ except OSError as exc:
 # The original module only loads settings during on_startup(), so replacing the
 # path here safely redirects all existing load/save calls without rewriting it.
 app.SETTINGS_FILE = os.path.join(DATA_DIR, DATA_FILE_NAME)
+
+# Runtime-only patches keep the large original file unchanged and easy to roll back.
+hotfixes.install(app)
 
 extension_router = Router(name="optimist_production_extensions")
 
@@ -81,13 +86,21 @@ async def cmd_status(message: types.Message):
     except Exception:
         telegram_state = "🔴"
 
+    last_image = html.escape(hotfixes.image_diag_text())
     text = (
         "🤖 <b>OPTIMIST STATUS</b>\n\n"
         f"{telegram_state} Telegram API\n"
         f"{_provider_state('GROQ_API_KEY')} Groq\n"
         f"{_provider_state('GEMINI_API_KEY')} Gemini\n"
         f"{_provider_state('OPENROUTER_API_KEY')} OpenRouter\n"
-        f"{_provider_state('GITHUB_MODELS_TOKEN') if os.getenv('GITHUB_MODELS_TOKEN') else _provider_state('GITHUB_TOKEN')} GitHub Models\n\n"
+        f"{_provider_state('GITHUB_MODELS_TOKEN') if os.getenv('GITHUB_MODELS_TOKEN') else _provider_state('GITHUB_TOKEN')} GitHub Models\n"
+        "🧠 Smart replies: <b>ON</b>\n\n"
+        "🎨 <b>Image providers</b>\n"
+        f"{_provider_state('PIXAZO_API_KEY')} Pixazo\n"
+        f"{_provider_state('GEMINI_API_KEY')} Gemini Image\n"
+        f"{_provider_state('HF_TOKEN') if os.getenv('HF_TOKEN') else _provider_state('HUGGINGFACE_API_KEY')} Hugging Face\n"
+        f"{_provider_state('POLLINATIONS_API_KEY')} Pollinations\n"
+        f"🧪 Последняя попытка: <code>{last_image}</code>\n\n"
         f"⏱ Uptime: <b>{uptime}</b>\n"
         f"💬 Сообщений в этом чате: <b>{stats.get('total_messages', 0)}</b>\n"
         f"🧠 В памяти для summary: <b>{len(stats.get('messages', []))}</b>\n"
