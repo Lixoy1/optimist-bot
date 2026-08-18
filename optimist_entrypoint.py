@@ -6,7 +6,7 @@ Keeps the original bot file untouched while adding:
 - /status and /diagnose diagnostics,
 - /missed [hours] rich catch-up summary,
 - weekly awards, social graph and crypto alerts,
-- smarter group-chat memory with bot-turn persistence,
+- legacy-style broad conversation memory with bot-turn persistence,
 - current image provider fallbacks,
 - current AI model routing with stale-model migration,
 - extension routers registered before the original catch-all handler.
@@ -80,9 +80,12 @@ def _provider_state(env_name: str) -> str:
 
 def _model_lines() -> str:
     models = ai_runtime.effective_models(app)
+    startup = "🟢 ready" if group_memory.AI_DIAGNOSTICS.get("startup_ready") else "🔴 not-ready"
     return (
-        f"🧠 Groq: <code>{html.escape(models['groq'])}</code>\n"
-        f"⚡ Groq fast: <code>{html.escape(models['groq_fast'])}</code>\n"
+        f"💬 Groq dialogue: <code>{html.escape(group_memory.LEGACY_DIALOGUE_MODEL)}</code>\n"
+        f"🧠 Groq quality fallback: <code>{html.escape(group_memory.GROUP_GROQ_FALLBACK_MODEL)}</code>\n"
+        f"⚡ Groq legacy fast fallback: <code>{html.escape(models['groq_fast'])}</code>\n"
+        f"✅ Groq startup: <b>{startup}</b>\n"
         f"✨ Gemini: <code>{html.escape(models['gemini'])}</code>\n"
         f"🖼 Gemini Image: <code>{html.escape(models['gemini_image'])}</code>\n"
         f"🧩 OpenRouter reasoning: <code>{html.escape(models['openrouter_reasoning'])}</code>\n"
@@ -114,11 +117,11 @@ async def cmd_status(message: types.Message):
         f"{_provider_state('GEMINI_API_KEY')} Gemini\n"
         f"{_provider_state('OPENROUTER_API_KEY')} OpenRouter\n"
         f"{_provider_state('GITHUB_MODELS_TOKEN') if os.getenv('GITHUB_MODELS_TOKEN') else _provider_state('GITHUB_TOKEN')} GitHub Models\n"
-        "🧠 Smart replies: <b>ON</b>\n"
+        "🧠 Dialogue brain: <b>LEGACY BROAD CONTEXT</b>\n"
         "🗣 Group memory: <b>humans + bot replies</b>\n"
         f"🧪 Последний AI: <code>{last_ai}</code>\n"
         f"🎭 Режимов: <b>{len(modes)}</b>\n\n"
-        "<b>Эффективные модели</b>\n"
+        "<b>Фактическая AI-маршрутизация</b>\n"
         f"{_model_lines()}\n\n"
         "🎨 <b>Image providers</b>\n"
         f"{_provider_state('PIXAZO_API_KEY')} Pixazo\n"
@@ -139,7 +142,7 @@ async def cmd_status(message: types.Message):
 
 @extension_router.message(Command("diagnose"))
 async def cmd_diagnose(message: types.Message):
-    status = await message.reply("🧪 Проверяю AI API, Groq inference и режимы без вывода секретов...")
+    status = await message.reply("🧪 Проверяю AI API, реальные Groq completions и режимы без вывода секретов...")
 
     telegram_ok = True
     try:
@@ -168,9 +171,12 @@ async def cmd_diagnose(message: types.Message):
 
     lines.extend([
         "",
-        "🗣 <b>Память групп</b>",
-        f"🟢 human messages + bot replies; window={group_memory.GROUP_CONTEXT_MAX_MESSAGES}",
-        f"🟢 quality Groq fallback: <code>{html.escape(group_memory.GROUP_GROQ_FALLBACK_MODEL or 'off')}</code>",
+        "🧠 <b>Диалоговый движок</b>",
+        "🟢 legacy broad transcript — без reset/followup/ambient классификаторов",
+        f"🟢 dialogue: <code>{html.escape(group_memory.LEGACY_DIALOGUE_MODEL)}</code>",
+        f"🟢 quality fallback: <code>{html.escape(group_memory.GROUP_GROQ_FALLBACK_MODEL)}</code>",
+        f"🟢 context window: <b>{group_memory.GROUP_CONTEXT_MAX_MESSAGES}</b> turns",
+        f"{'🟢' if group_memory.AI_DIAGNOSTICS.get('startup_ready') else '🔴'} startup Groq readiness: <code>{html.escape(str(group_memory.AI_DIAGNOSTICS.get('startup_detail') or 'unknown'))}</code>",
         "",
         "🎭 <b>Режимы</b>",
     ])
@@ -271,6 +277,8 @@ async def cmd_missed(message: types.Message):
 
 
 async def production_startup():
+    # group_memory wraps the original startup and refuses Railway readiness if
+    # the configured Groq key cannot perform a real completion.
     await app.on_startup()
     current = await app.bot.get_my_commands()
     existing = {cmd.command for cmd in current}
