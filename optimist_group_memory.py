@@ -11,7 +11,7 @@ import asyncio
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -85,7 +85,6 @@ def _assistant_memory(app, chat_id: int) -> List[Dict[str, Any]]:
 
 
 def _prior_group_history(app, chat_id: int, current_item: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Pull extra human messages because assistant turns are merged separately.
     humans = app.get_recent_messages(chat_id, limit=GROUP_CONTEXT_MAX_MESSAGES * 2)
     if humans:
         # main_handler stores the current user message immediately before asking AI.
@@ -130,6 +129,12 @@ def build_group_context(messages: List[Dict[str, Any]], max_chars: int = GROUP_C
 
 
 def _groq_payload(model: str, system_prompt: str, user_text: str, max_tokens: int, temperature: float) -> Dict[str, Any]:
+    """Build a model-specific Groq Chat Completions request.
+
+    GPT-OSS supports reasoning_effort plus include_reasoning, but not
+    reasoning_format. Qwen 3.6 supports reasoning_effort=none/default and
+    reasoning_format=hidden/parsed/raw.
+    """
     payload: Dict[str, Any] = {
         "model": model,
         "messages": [
@@ -141,7 +146,7 @@ def _groq_payload(model: str, system_prompt: str, user_text: str, max_tokens: in
     }
     if model.startswith("openai/gpt-oss"):
         payload["reasoning_effort"] = "medium"
-        payload["reasoning_format"] = "hidden"
+        payload["include_reasoning"] = False
     elif model.startswith("qwen/"):
         payload["reasoning_effort"] = "none"
         payload["reasoning_format"] = "hidden"
@@ -226,8 +231,8 @@ async def groq_chat(app, model: str, system_prompt: str, user_text: str, max_tok
 async def group_smart_get_llm_response(app, hotfixes, user_text: str, chat_id: int, user_name: str) -> str:
     global _BASE_SMART
 
-    # Keep private chats and the specialized investment reasoning flow unchanged.
     mood_key = app.chat_settings[str(chat_id)].get("mood", "optimist")
+    # Keep private chats and the specialized investment reasoning flow unchanged.
     if chat_id >= 0 or mood_key == "investor_genius":
         return await _BASE_SMART(app, user_text, chat_id, user_name)
 
@@ -282,8 +287,8 @@ async def group_smart_get_llm_response(app, hotfixes, user_text: str, chat_id: i
         f"Последний релевантный фрагмент группового разговора:\n{context}"
     )
 
-    # Quality-first Groq path. 120B stays primary; Qwen 3.6 is a quality
-    # fallback before the old generic provider chain and the smaller 20B model.
+    # Quality-first Groq path. 120B stays primary; Qwen 3.6 is a dialogue
+    # fallback before the generic provider chain and smaller 20B model.
     primary = str(getattr(app, "GROQ_MODEL", "") or "")
     groq_models = [model for model in [primary, GROUP_GROQ_FALLBACK_MODEL] if model]
     seen = set()
@@ -295,8 +300,6 @@ async def group_smart_get_llm_response(app, hotfixes, user_text: str, chat_id: i
         if answer:
             return answer
 
-    # Existing Gemini/OpenRouter/GitHub fallbacks remain available. The old
-    # ask_llm may retry Groq, which is intentional if the direct request failed transiently.
     answer = await app.ask_llm(
         system_prompt,
         cleaned,
@@ -328,8 +331,6 @@ async def _record_assistant_turn(app, chat_id: int, user_name: str, response: st
         "ts": time.time(),
     })
     del memory[:-ASSISTANT_MEMORY_MAX]
-    # Persist both the latest human messages and assistant memory without
-    # blocking the event loop on JSON I/O.
     try:
         await asyncio.to_thread(app.save_settings)
     except Exception as exc:
@@ -341,7 +342,7 @@ async def probe_groq_inference(app) -> Dict[str, Dict[str, Any]]:
     if not getattr(app, "GROQ_API_KEY", None):
         return {"Groq inference": {"ok": False, "status": None, "detail": "key not configured"}}
 
-    models = []
+    models: List[str] = []
     for model in [str(getattr(app, "GROQ_MODEL", "") or ""), GROUP_GROQ_FALLBACK_MODEL]:
         if model and model not in models:
             models.append(model)
@@ -399,9 +400,8 @@ def install(app, hotfixes) -> None:
             await _record_assistant_turn(app, chat_id, user_name, response)
         return response
 
-    # hotfixes.install() created app.get_llm_response as a closure that resolves
-    # hotfixes.smart_get_llm_response dynamically. Replace both lookup points so
-    # tests and runtime behave identically.
+    # Keep the public hotfix lookup group-aware for tests and any future caller,
+    # while making app.get_llm_response persist the bot's own turns.
     hotfixes.smart_get_llm_response = lambda runtime_app, user_text, chat_id, user_name: group_smart_get_llm_response(
         runtime_app, hotfixes, user_text, chat_id, user_name
     )
